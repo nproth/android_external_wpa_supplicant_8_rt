@@ -21,24 +21,22 @@ L_CFLAGS = -DWPA_IGNORE_CONFIG_ERRORS
 
 L_CFLAGS += -DVERSION_STR_POSTFIX=\"-$(PLATFORM_VERSION)\"
 
+# REALTEK
+ifeq ($(BOARD_WIFI_VENDOR), realtek)
+L_CFLAGS += -DREALTEK_WIFI_VENDOR
+endif
+
 # Set Android log name
 L_CFLAGS += -DANDROID_LOG_NAME=\"hostapd\"
 
-ifeq ($(BOARD_WLAN_DEVICE), bcmdhd)
-L_CFLAGS += -DANDROID_P2P
-endif
+# Disable unused parameter warnings
+L_CFLAGS += -Wno-unused-parameter
 
-ifeq ($(BOARD_WLAN_DEVICE), qcwcn)
+# Set Android extended P2P functionality
 L_CFLAGS += -DANDROID_P2P
-endif
 
-ifeq ($(BOARD_WLAN_DEVICE), mrvl)
-L_CFLAGS += -DANDROID_P2P
-endif
-
-ifeq ($(BOARD_WIFI_VENDOR), realtek)
-L_CFLAGS += -DREALTEK_WIFI_VENDOR
-L_CFLAGS += -DANDROID_P2P
+ifeq ($(BOARD_HOSTAPD_PRIVATE_LIB),)
+L_CFLAGS += -DANDROID_LIB_STUB
 endif
 
 # Use Android specific directory for control interface sockets
@@ -50,16 +48,16 @@ ifeq ($(TARGET_ARCH),arm)
 L_CFLAGS += -mabi=aapcs-linux
 endif
 
-# To allow non-ASCII characters in SSID
-L_CFLAGS += -DWPA_UNICODE_SSID
-
 INCLUDES = $(LOCAL_PATH)
 INCLUDES += $(LOCAL_PATH)/src
 INCLUDES += $(LOCAL_PATH)/src/utils
-INCLUDES += external/openssl/include
 INCLUDES += system/security/keystore/include
 ifdef CONFIG_DRIVER_NL80211
+ifneq ($(wildcard external/libnl),)
+INCLUDES += external/libnl/include
+else
 INCLUDES += external/libnl-headers
+endif
 endif
 
 
@@ -102,6 +100,7 @@ OBJS += src/ap/preauth_auth.c
 OBJS += src/ap/pmksa_cache_auth.c
 OBJS += src/ap/ieee802_11_shared.c
 OBJS += src/ap/beacon.c
+OBJS += src/ap/bss_load.c
 OBJS_d =
 OBJS_p =
 LIBS =
@@ -113,7 +112,6 @@ NEED_RC4=y
 NEED_AES=y
 NEED_MD5=y
 NEED_SHA1=y
-NEED_SHA256=y
 
 OBJS += src/drivers/drivers.c
 L_CFLAGS += -DHOSTAPD
@@ -141,15 +139,16 @@ OBJS += src/utils/ip_addr.c
 
 OBJS += src/common/ieee802_11_common.c
 OBJS += src/common/wpa_common.c
+OBJS += src/common/hw_features_common.c
 
 OBJS += src/eapol_auth/eapol_auth_sm.c
 
 
 ifndef CONFIG_NO_DUMP_STATE
-# define HOSTAPD_DUMP_STATE to include SIGUSR1 handler for dumping state to
-# a file (undefine it, if you want to save in binary size)
+# define HOSTAPD_DUMP_STATE to include support for dumping internal state
+# through control interface commands (undefine it, if you want to save in
+# binary size)
 L_CFLAGS += -DHOSTAPD_DUMP_STATE
-OBJS += dump_state.c
 OBJS += src/eapol_auth/eapol_auth_dump.c
 endif
 
@@ -187,8 +186,6 @@ OBJS += ctrl_iface.c
 OBJS += src/ap/ctrl_iface_ap.c
 endif
 
-OBJS += src/crypto/md5.c
-
 L_CFLAGS += -DCONFIG_CTRL_IFACE -DCONFIG_CTRL_IFACE_UNIX
 
 ifdef CONFIG_IAPP
@@ -204,6 +201,26 @@ endif
 ifdef CONFIG_PEERKEY
 L_CFLAGS += -DCONFIG_PEERKEY
 OBJS += src/ap/peerkey_auth.c
+endif
+
+ifdef CONFIG_HS20
+NEED_AES_OMAC1=y
+CONFIG_PROXYARP=y
+endif
+
+ifdef CONFIG_PROXYARP
+CONFIG_L2_PACKET=y
+endif
+
+ifdef CONFIG_SUITEB
+L_CFLAGS += -DCONFIG_SUITEB
+NEED_SHA256=y
+NEED_AES_OMAC1=y
+endif
+
+ifdef CONFIG_SUITEB192
+L_CFLAGS += -DCONFIG_SUITEB192
+NEED_SHA384=y
 endif
 
 ifdef CONFIG_IEEE80211W
@@ -360,7 +377,7 @@ ifdef CONFIG_EAP_GPSK
 L_CFLAGS += -DEAP_SERVER_GPSK
 OBJS += src/eap_server/eap_server_gpsk.c src/eap_common/eap_gpsk_common.c
 ifdef CONFIG_EAP_GPSK_SHA256
-L_CFLAGS += -DEAP_SERVER_GPSK_SHA256
+L_CFLAGS += -DEAP_GPSK_SHA256
 endif
 NEED_SHA256=y
 NEED_AES_OMAC1=y
@@ -394,10 +411,6 @@ NEED_AES_UNWRAP=y
 endif
 
 ifdef CONFIG_WPS
-ifdef CONFIG_WPS2
-L_CFLAGS += -DCONFIG_WPS2
-endif
-
 L_CFLAGS += -DCONFIG_WPS -DEAP_SERVER_WSC
 OBJS += src/utils/uuid.c
 OBJS += src/ap/wps_hostapd.c
@@ -536,46 +549,17 @@ ifeq ($(CONFIG_TLS), gnutls)
 ifdef TLS_FUNCS
 OBJS += src/crypto/tls_gnutls.c
 LIBS += -lgnutls -lgpg-error
-ifdef CONFIG_GNUTLS_EXTRA
-L_CFLAGS += -DCONFIG_GNUTLS_EXTRA
-LIBS += -lgnutls-extra
-endif
 endif
 OBJS += src/crypto/crypto_gnutls.c
 HOBJS += src/crypto/crypto_gnutls.c
 ifdef NEED_FIPS186_2_PRF
-OBJS += src/crypto/fips_prf_gnutls.c
+OBJS += src/crypto/fips_prf_internal.c
+OBJS += src/crypto/sha1-internal.c
 endif
 LIBS += -lgcrypt
 LIBS_h += -lgcrypt
 CONFIG_INTERNAL_SHA256=y
 CONFIG_INTERNAL_RC4=y
-CONFIG_INTERNAL_DH_GROUP5=y
-endif
-
-ifeq ($(CONFIG_TLS), schannel)
-ifdef TLS_FUNCS
-OBJS += src/crypto/tls_schannel.c
-endif
-OBJS += src/crypto/crypto_cryptoapi.c
-OBJS_p += src/crypto/crypto_cryptoapi.c
-CONFIG_INTERNAL_SHA256=y
-CONFIG_INTERNAL_RC4=y
-CONFIG_INTERNAL_DH_GROUP5=y
-endif
-
-ifeq ($(CONFIG_TLS), nss)
-ifdef TLS_FUNCS
-OBJS += src/crypto/tls_nss.c
-LIBS += -lssl3
-endif
-OBJS += src/crypto/crypto_nss.c
-ifdef NEED_FIPS186_2_PRF
-OBJS += src/crypto/fips_prf_nss.c
-endif
-LIBS += -lnss3
-LIBS_h += -lnss3
-CONFIG_INTERNAL_MD4=y
 CONFIG_INTERNAL_DH_GROUP5=y
 endif
 
@@ -685,7 +669,9 @@ ifdef CONFIG_INTERNAL_AES
 AESOBJS += src/crypto/aes-internal.c src/crypto/aes-internal-enc.c
 endif
 
+ifneq ($(CONFIG_TLS), openssl)
 AESOBJS += src/crypto/aes-wrap.c
+endif
 ifdef NEED_AES_EAX
 AESOBJS += src/crypto/aes-eax.c
 NEED_AES_CTR=y
@@ -700,12 +686,16 @@ ifdef NEED_AES_OMAC1
 AESOBJS += src/crypto/aes-omac1.c
 endif
 ifdef NEED_AES_UNWRAP
+ifneq ($(CONFIG_TLS), openssl)
 NEED_AES_DEC=y
 AESOBJS += src/crypto/aes-unwrap.c
 endif
+endif
 ifdef NEED_AES_CBC
 NEED_AES_DEC=y
+ifneq ($(CONFIG_TLS), openssl)
 AESOBJS += src/crypto/aes-cbc.c
+endif
 endif
 ifdef NEED_AES_DEC
 ifdef CONFIG_INTERNAL_AES
@@ -741,6 +731,10 @@ endif
 
 ifdef NEED_SHA1
 OBJS += $(SHA1OBJS)
+endif
+
+ifneq ($(CONFIG_TLS), openssl)
+OBJS += src/crypto/md5.c
 endif
 
 ifdef NEED_MD5
@@ -781,6 +775,9 @@ ifdef NEED_TLS_PRF_SHA256
 OBJS += src/crypto/sha256-tlsprf.c
 endif
 endif
+ifdef NEED_SHA384
+L_CFLAGS += -DCONFIG_SHA384
+endif
 
 ifdef NEED_DH_GROUPS
 OBJS += src/crypto/dh_groups.c
@@ -805,7 +802,9 @@ OBJS += src/crypto/random.c
 HOBJS += src/crypto/random.c
 HOBJS += src/utils/eloop.c
 HOBJS += $(SHA1OBJS)
+ifneq ($(CONFIG_TLS), openssl)
 HOBJS += src/crypto/md5.c
+endif
 endif
 
 ifdef CONFIG_RADIUS_SERVER
@@ -836,6 +835,7 @@ OBJS += src/ap/wmm.c
 OBJS += src/ap/ap_list.c
 OBJS += src/ap/ieee802_11.c
 OBJS += src/ap/hw_features.c
+OBJS += src/ap/dfs.c
 L_CFLAGS += -DNEED_AP_MLME
 endif
 ifdef CONFIG_IEEE80211N
@@ -863,10 +863,29 @@ OBJS += src/common/gas.c
 OBJS += src/ap/gas_serv.c
 endif
 
+ifdef CONFIG_PROXYARP
+L_CFLAGS += -DCONFIG_PROXYARP
+OBJS += src/ap/x_snoop.c
+OBJS += src/ap/dhcp_snoop.c
+ifdef CONFIG_IPV6
+OBJS += src/ap/ndisc_snoop.c
+endif
+endif
+
 OBJS += src/drivers/driver_common.c
+
+ifdef CONFIG_ACS
+L_CFLAGS += -DCONFIG_ACS
+OBJS += src/ap/acs.c
+LIBS += -lm
+endif
 
 ifdef CONFIG_NO_STDOUT_DEBUG
 L_CFLAGS += -DCONFIG_NO_STDOUT_DEBUG
+endif
+
+ifdef CONFIG_DEBUG_LINUX_TRACING
+L_CFLAGS += -DCONFIG_DEBUG_LINUX_TRACING
 endif
 
 ifdef CONFIG_DEBUG_FILE
@@ -879,6 +898,7 @@ endif
 
 OBJS_c = hostapd_cli.c src/common/wpa_ctrl.c src/utils/os_$(CONFIG_OS).c
 OBJS_c += src/utils/eloop.c
+OBJS_c += src/utils/common.c
 ifdef CONFIG_WPA_TRACE
 OBJS_c += src/utils/trace.c
 endif
@@ -887,12 +907,6 @@ ifdef CONFIG_WPA_CLI_EDIT
 OBJS_c += src/utils/edit.c
 else
 OBJS_c += src/utils/edit_simple.c
-endif
-
-ifdef CONFIG_ACS
-L_CFLAGS += -DCONFIG_ACS
-OBJS += src/ap/acs.c
-LIBS += -lm
 endif
 
 ########################
@@ -918,7 +932,11 @@ LOCAL_STATIC_LIBRARIES += $(BOARD_HOSTAPD_PRIVATE_LIB)
 endif
 LOCAL_SHARED_LIBRARIES := libc libcutils liblog libcrypto libssl
 ifdef CONFIG_DRIVER_NL80211
+ifneq ($(wildcard external/libnl),)
+LOCAL_SHARED_LIBRARIES += libnl
+else
 LOCAL_STATIC_LIBRARIES += libnl_2
+endif
 endif
 LOCAL_CFLAGS := $(L_CFLAGS)
 LOCAL_SRC_FILES := $(OBJS)

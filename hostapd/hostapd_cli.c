@@ -1,6 +1,6 @@
 /*
  * hostapd - command line interface for hostapd daemon
- * Copyright (c) 2004-2012, Jouni Malinen <j@w1.fi>
+ * Copyright (c) 2004-2015, Jouni Malinen <j@w1.fi>
  *
  * This software may be distributed under the terms of the BSD license.
  * See README for more details.
@@ -10,22 +10,23 @@
 #include <dirent.h>
 
 #include "common/wpa_ctrl.h"
+#include "common/ieee802_11_defs.h"
 #include "utils/common.h"
 #include "utils/eloop.h"
 #include "utils/edit.h"
 #include "common/version.h"
 
 
-static const char *hostapd_cli_version =
+static const char *const hostapd_cli_version =
 "hostapd_cli v" VERSION_STR "\n"
-"Copyright (c) 2004-2013, Jouni Malinen <j@w1.fi> and contributors";
+"Copyright (c) 2004-2015, Jouni Malinen <j@w1.fi> and contributors";
 
 
-static const char *hostapd_cli_license =
+static const char *const hostapd_cli_license =
 "This software may be distributed under the terms of the BSD license.\n"
 "See README for more details.\n";
 
-static const char *hostapd_cli_full_license =
+static const char *const hostapd_cli_full_license =
 "This software may be distributed under the terms of the BSD license.\n"
 "\n"
 "Redistribution and use in source and binary forms, with or without\n"
@@ -56,7 +57,7 @@ static const char *hostapd_cli_full_license =
 "OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.\n"
 "\n";
 
-static const char *commands_help =
+static const char *const commands_help =
 "Commands:\n"
 "   mib                  get MIB variables (dot1x, dot11, radius)\n"
 "   sta <addr>           get MIB variables for one station\n"
@@ -216,8 +217,21 @@ static int hostapd_cli_cmd_relog(struct wpa_ctrl *ctrl, int argc, char *argv[])
 }
 
 
+static int hostapd_cli_cmd_status(struct wpa_ctrl *ctrl, int argc, char *argv[])
+{
+	if (argc > 0 && os_strcmp(argv[0], "driver") == 0)
+		return wpa_ctrl_command(ctrl, "STATUS-DRIVER");
+	return wpa_ctrl_command(ctrl, "STATUS");
+}
+
+
 static int hostapd_cli_cmd_mib(struct wpa_ctrl *ctrl, int argc, char *argv[])
 {
+	if (argc > 0) {
+		char buf[100];
+		os_snprintf(buf, sizeof(buf), "MIB %s", argv[0]);
+		return wpa_ctrl_command(ctrl, buf);
+	}
 	return wpa_ctrl_command(ctrl, "MIB");
 }
 
@@ -261,12 +275,15 @@ static void hostapd_cli_action_process(char *msg, size_t len)
 static int hostapd_cli_cmd_sta(struct wpa_ctrl *ctrl, int argc, char *argv[])
 {
 	char buf[64];
-	if (argc != 1) {
-		printf("Invalid 'sta' command - exactly one argument, STA "
+	if (argc < 1) {
+		printf("Invalid 'sta' command - at least one argument, STA "
 		       "address, is required.\n");
 		return -1;
 	}
-	snprintf(buf, sizeof(buf), "STA %s", argv[0]);
+	if (argc > 1)
+		snprintf(buf, sizeof(buf), "STA %s %s", argv[0], argv[1]);
+	else
+		snprintf(buf, sizeof(buf), "STA %s", argv[0]);
 	return wpa_ctrl_command(ctrl, buf);
 }
 
@@ -377,7 +394,7 @@ static int hostapd_cli_cmd_wps_check_pin(struct wpa_ctrl *ctrl, int argc,
 	else
 		res = os_snprintf(cmd, sizeof(cmd), "WPS_CHECK_PIN %s",
 				  argv[0]);
-	if (res < 0 || (size_t) res >= sizeof(cmd) - 1) {
+	if (os_snprintf_error(sizeof(cmd), res)) {
 		printf("Too long WPS_CHECK_PIN command.\n");
 		return -1;
 	}
@@ -440,7 +457,7 @@ static int hostapd_cli_cmd_wps_nfc_config_token(struct wpa_ctrl *ctrl,
 
 	res = os_snprintf(cmd, sizeof(cmd), "WPS_NFC_CONFIG_TOKEN %s",
 			  argv[0]);
-	if (res < 0 || (size_t) res >= sizeof(cmd) - 1) {
+	if (os_snprintf_error(sizeof(cmd), res)) {
 		printf("Too long WPS_NFC_CONFIG_TOKEN command.\n");
 		return -1;
 	}
@@ -461,7 +478,7 @@ static int hostapd_cli_cmd_wps_nfc_token(struct wpa_ctrl *ctrl,
 	}
 
 	res = os_snprintf(cmd, sizeof(cmd), "WPS_NFC_TOKEN %s", argv[0]);
-	if (res < 0 || (size_t) res >= sizeof(cmd) - 1) {
+	if (os_snprintf_error(sizeof(cmd), res)) {
 		printf("Too long WPS_NFC_TOKEN command.\n");
 		return -1;
 	}
@@ -483,7 +500,7 @@ static int hostapd_cli_cmd_nfc_get_handover_sel(struct wpa_ctrl *ctrl,
 
 	res = os_snprintf(cmd, sizeof(cmd), "NFC_GET_HANDOVER_SEL %s %s",
 			  argv[0], argv[1]);
-	if (res < 0 || (size_t) res >= sizeof(cmd) - 1) {
+	if (os_snprintf_error(sizeof(cmd), res)) {
 		printf("Too long NFC_GET_HANDOVER_SEL command.\n");
 		return -1;
 	}
@@ -525,7 +542,7 @@ static int hostapd_cli_cmd_wps_config(struct wpa_ctrl *ctrl, int argc,
 				      char *argv[])
 {
 	char buf[256];
-	char ssid_hex[2 * 32 + 1];
+	char ssid_hex[2 * SSID_MAX_LEN + 1];
 	char key_hex[2 * 64 + 1];
 	int i;
 
@@ -536,7 +553,7 @@ static int hostapd_cli_cmd_wps_config(struct wpa_ctrl *ctrl, int argc,
 	}
 
 	ssid_hex[0] = '\0';
-	for (i = 0; i < 32; i++) {
+	for (i = 0; i < SSID_MAX_LEN; i++) {
 		if (argv[0][i] == '\0')
 			break;
 		os_snprintf(&ssid_hex[i * 2], 3, "%02x", argv[0][i]);
@@ -580,7 +597,7 @@ static int hostapd_cli_cmd_disassoc_imminent(struct wpa_ctrl *ctrl, int argc,
 
 	res = os_snprintf(buf, sizeof(buf), "DISASSOC_IMMINENT %s %s",
 			  argv[0], argv[1]);
-	if (res < 0 || res >= (int) sizeof(buf))
+	if (os_snprintf_error(sizeof(buf), res))
 		return -1;
 	return wpa_ctrl_command(ctrl, buf);
 }
@@ -600,8 +617,35 @@ static int hostapd_cli_cmd_ess_disassoc(struct wpa_ctrl *ctrl, int argc,
 
 	res = os_snprintf(buf, sizeof(buf), "ESS_DISASSOC %s %s %s",
 			  argv[0], argv[1], argv[2]);
-	if (res < 0 || res >= (int) sizeof(buf))
+	if (os_snprintf_error(sizeof(buf), res))
 		return -1;
+	return wpa_ctrl_command(ctrl, buf);
+}
+
+
+static int hostapd_cli_cmd_bss_tm_req(struct wpa_ctrl *ctrl, int argc,
+				      char *argv[])
+{
+	char buf[2000], *tmp;
+	int res, i, total;
+
+	if (argc < 1) {
+		printf("Invalid 'bss_tm_req' command - at least one argument (STA addr) is needed\n");
+		return -1;
+	}
+
+	res = os_snprintf(buf, sizeof(buf), "BSS_TM_REQ %s", argv[0]);
+	if (os_snprintf_error(sizeof(buf), res))
+		return -1;
+
+	total = res;
+	for (i = 1; i < argc; i++) {
+		tmp = &buf[total];
+		res = os_snprintf(tmp, sizeof(buf) - total, " %s", argv[i]);
+		if (os_snprintf_error(sizeof(buf) - total, res))
+			return -1;
+		total += res;
+	}
 	return wpa_ctrl_command(ctrl, buf);
 }
 
@@ -679,6 +723,90 @@ static int hostapd_cli_cmd_license(struct wpa_ctrl *ctrl, int argc,
 }
 
 
+static int hostapd_cli_cmd_set_qos_map_set(struct wpa_ctrl *ctrl,
+					   int argc, char *argv[])
+{
+	char buf[200];
+	int res;
+
+	if (argc != 1) {
+		printf("Invalid 'set_qos_map_set' command - "
+		       "one argument (comma delimited QoS map set) "
+		       "is needed\n");
+		return -1;
+	}
+
+	res = os_snprintf(buf, sizeof(buf), "SET_QOS_MAP_SET %s", argv[0]);
+	if (os_snprintf_error(sizeof(buf), res))
+		return -1;
+	return wpa_ctrl_command(ctrl, buf);
+}
+
+
+static int hostapd_cli_cmd_send_qos_map_conf(struct wpa_ctrl *ctrl,
+					     int argc, char *argv[])
+{
+	char buf[50];
+	int res;
+
+	if (argc != 1) {
+		printf("Invalid 'send_qos_map_conf' command - "
+		       "one argument (STA addr) is needed\n");
+		return -1;
+	}
+
+	res = os_snprintf(buf, sizeof(buf), "SEND_QOS_MAP_CONF %s", argv[0]);
+	if (os_snprintf_error(sizeof(buf), res))
+		return -1;
+	return wpa_ctrl_command(ctrl, buf);
+}
+
+
+static int hostapd_cli_cmd_hs20_wnm_notif(struct wpa_ctrl *ctrl, int argc,
+					  char *argv[])
+{
+	char buf[300];
+	int res;
+
+	if (argc < 2) {
+		printf("Invalid 'hs20_wnm_notif' command - two arguments (STA "
+		       "addr and URL) are needed\n");
+		return -1;
+	}
+
+	res = os_snprintf(buf, sizeof(buf), "HS20_WNM_NOTIF %s %s",
+			  argv[0], argv[1]);
+	if (os_snprintf_error(sizeof(buf), res))
+		return -1;
+	return wpa_ctrl_command(ctrl, buf);
+}
+
+
+static int hostapd_cli_cmd_hs20_deauth_req(struct wpa_ctrl *ctrl, int argc,
+					   char *argv[])
+{
+	char buf[300];
+	int res;
+
+	if (argc < 3) {
+		printf("Invalid 'hs20_deauth_req' command - at least three arguments (STA addr, Code, Re-auth Delay) are needed\n");
+		return -1;
+	}
+
+	if (argc > 3)
+		res = os_snprintf(buf, sizeof(buf),
+				  "HS20_DEAUTH_REQ %s %s %s %s",
+				  argv[0], argv[1], argv[2], argv[3]);
+	else
+		res = os_snprintf(buf, sizeof(buf),
+				  "HS20_DEAUTH_REQ %s %s %s",
+				  argv[0], argv[1], argv[2]);
+	if (os_snprintf_error(sizeof(buf), res))
+		return -1;
+	return wpa_ctrl_command(ctrl, buf);
+}
+
+
 static int hostapd_cli_cmd_quit(struct wpa_ctrl *ctrl, int argc, char *argv[])
 {
 	hostapd_cli_quit = 1;
@@ -733,8 +861,10 @@ static int hostapd_cli_cmd_interface(struct wpa_ctrl *ctrl, int argc,
 	}
 
 	hostapd_cli_close_connection();
-	free(ctrl_ifname);
-	ctrl_ifname = strdup(argv[0]);
+	os_free(ctrl_ifname);
+	ctrl_ifname = os_strdup(argv[0]);
+	if (ctrl_ifname == NULL)
+		return -1;
 
 	if (hostapd_cli_open_connection(ctrl_ifname)) {
 		printf("Connected to interface '%s.\n", ctrl_ifname);
@@ -764,7 +894,7 @@ static int hostapd_cli_cmd_set(struct wpa_ctrl *ctrl, int argc, char *argv[])
 	}
 
 	res = os_snprintf(cmd, sizeof(cmd), "SET %s %s", argv[0], argv[1]);
-	if (res < 0 || (size_t) res >= sizeof(cmd) - 1) {
+	if (os_snprintf_error(sizeof(cmd), res)) {
 		printf("Too long SET command.\n");
 		return -1;
 	}
@@ -784,11 +914,99 @@ static int hostapd_cli_cmd_get(struct wpa_ctrl *ctrl, int argc, char *argv[])
 	}
 
 	res = os_snprintf(cmd, sizeof(cmd), "GET %s", argv[0]);
-	if (res < 0 || (size_t) res >= sizeof(cmd) - 1) {
+	if (os_snprintf_error(sizeof(cmd), res)) {
 		printf("Too long GET command.\n");
 		return -1;
 	}
 	return wpa_ctrl_command(ctrl, cmd);
+}
+
+
+static int hostapd_cli_cmd_chan_switch(struct wpa_ctrl *ctrl,
+				       int argc, char *argv[])
+{
+	char cmd[256];
+	int res;
+	int i;
+	char *tmp;
+	int total;
+
+	if (argc < 2) {
+		printf("Invalid chan_switch command: needs at least two "
+		       "arguments (count and freq)\n"
+		       "usage: <cs_count> <freq> [sec_channel_offset=] "
+		       "[center_freq1=] [center_freq2=] [bandwidth=] "
+		       "[blocktx] [ht|vht]\n");
+		return -1;
+	}
+
+	res = os_snprintf(cmd, sizeof(cmd), "CHAN_SWITCH %s %s",
+			  argv[0], argv[1]);
+	if (os_snprintf_error(sizeof(cmd), res)) {
+		printf("Too long CHAN_SWITCH command.\n");
+		return -1;
+	}
+
+	total = res;
+	for (i = 2; i < argc; i++) {
+		tmp = cmd + total;
+		res = os_snprintf(tmp, sizeof(cmd) - total, " %s", argv[i]);
+		if (os_snprintf_error(sizeof(cmd) - total, res)) {
+			printf("Too long CHAN_SWITCH command.\n");
+			return -1;
+		}
+		total += res;
+	}
+	return wpa_ctrl_command(ctrl, cmd);
+}
+
+
+static int hostapd_cli_cmd_enable(struct wpa_ctrl *ctrl, int argc,
+				      char *argv[])
+{
+	return wpa_ctrl_command(ctrl, "ENABLE");
+}
+
+
+static int hostapd_cli_cmd_reload(struct wpa_ctrl *ctrl, int argc,
+				      char *argv[])
+{
+	return wpa_ctrl_command(ctrl, "RELOAD");
+}
+
+
+static int hostapd_cli_cmd_disable(struct wpa_ctrl *ctrl, int argc,
+				      char *argv[])
+{
+	return wpa_ctrl_command(ctrl, "DISABLE");
+}
+
+
+static int hostapd_cli_cmd_vendor(struct wpa_ctrl *ctrl, int argc, char *argv[])
+{
+	char cmd[256];
+	int res;
+
+	if (argc < 2 || argc > 3) {
+		printf("Invalid vendor command\n"
+		       "usage: <vendor id> <command id> [<hex formatted command argument>]\n");
+		return -1;
+	}
+
+	res = os_snprintf(cmd, sizeof(cmd), "VENDOR %s %s %s", argv[0], argv[1],
+			  argc == 3 ? argv[2] : "");
+	if (os_snprintf_error(sizeof(cmd), res)) {
+		printf("Too long VENDOR command.\n");
+		return -1;
+	}
+	return wpa_ctrl_command(ctrl, cmd);
+}
+
+
+static int hostapd_cli_cmd_erp_flush(struct wpa_ctrl *ctrl, int argc,
+				     char *argv[])
+{
+	return wpa_ctrl_command(ctrl, "ERP_FLUSH");
 }
 
 
@@ -797,10 +1015,11 @@ struct hostapd_cli_cmd {
 	int (*handler)(struct wpa_ctrl *ctrl, int argc, char *argv[]);
 };
 
-static struct hostapd_cli_cmd hostapd_cli_commands[] = {
+static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
 	{ "ping", hostapd_cli_cmd_ping },
 	{ "mib", hostapd_cli_cmd_mib },
 	{ "relog", hostapd_cli_cmd_relog },
+	{ "status", hostapd_cli_cmd_status },
 	{ "sta", hostapd_cli_cmd_sta },
 	{ "all_sta", hostapd_cli_cmd_all_sta },
 	{ "new_sta", hostapd_cli_cmd_new_sta },
@@ -826,6 +1045,7 @@ static struct hostapd_cli_cmd hostapd_cli_commands[] = {
 #endif /* CONFIG_WPS */
 	{ "disassoc_imminent", hostapd_cli_cmd_disassoc_imminent },
 	{ "ess_disassoc", hostapd_cli_cmd_ess_disassoc },
+	{ "bss_tm_req", hostapd_cli_cmd_bss_tm_req },
 	{ "get_config", hostapd_cli_cmd_get_config },
 	{ "help", hostapd_cli_cmd_help },
 	{ "interface", hostapd_cli_cmd_interface },
@@ -834,13 +1054,23 @@ static struct hostapd_cli_cmd hostapd_cli_commands[] = {
 	{ "quit", hostapd_cli_cmd_quit },
 	{ "set", hostapd_cli_cmd_set },
 	{ "get", hostapd_cli_cmd_get },
+	{ "set_qos_map_set", hostapd_cli_cmd_set_qos_map_set },
+	{ "send_qos_map_conf", hostapd_cli_cmd_send_qos_map_conf },
+	{ "chan_switch", hostapd_cli_cmd_chan_switch },
+	{ "hs20_wnm_notif", hostapd_cli_cmd_hs20_wnm_notif },
+	{ "hs20_deauth_req", hostapd_cli_cmd_hs20_deauth_req },
+	{ "vendor", hostapd_cli_cmd_vendor },
+	{ "enable", hostapd_cli_cmd_enable },
+	{ "reload", hostapd_cli_cmd_reload },
+	{ "disable", hostapd_cli_cmd_disable },
+	{ "erp_flush", hostapd_cli_cmd_erp_flush },
 	{ NULL, NULL }
 };
 
 
 static void wpa_request(struct wpa_ctrl *ctrl, int argc, char *argv[])
 {
-	struct hostapd_cli_cmd *cmd, *match = NULL;
+	const struct hostapd_cli_cmd *cmd, *match = NULL;
 	int count;
 
 	count = 0;

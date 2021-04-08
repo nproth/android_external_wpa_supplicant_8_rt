@@ -12,25 +12,25 @@
 #include <sys/wait.h>
 
 #ifdef ANDROID
-#if !defined(PURE_LINUX)
+#ifndef PURE_LINUX
 #include <sys/capability.h>
-#endif /* !defined(PURE_LINUX) */
-#include <linux/prctl.h>
-#if !defined(PURE_LINUX)
+#endif /* !PURE_LINUX */
+#include <sys/prctl.h>
+#ifndef PURE_LINUX
 #include <private/android_filesystem_config.h>
-#endif /* !defined(PURE_LINUX) */
+#endif /* !PURE_LINUX */
 #endif /* ANDROID */
 
 #include "os.h"
+#include "common.h"
 
 #ifdef WPA_TRACE
 
-#include "common.h"
 #include "wpa_debug.h"
 #include "trace.h"
 #include "list.h"
 
-static struct dl_list alloc_list;
+static struct dl_list alloc_list = DL_LIST_HEAD_INIT(alloc_list);
 
 #define ALLOC_MAGIC 0xa84ef1b2
 #define FREED_MAGIC 0x67fd487a
@@ -62,6 +62,43 @@ int os_get_time(struct os_time *t)
 	t->sec = tv.tv_sec;
 	t->usec = tv.tv_usec;
 	return res;
+}
+
+
+int os_get_reltime(struct os_reltime *t)
+{
+#if defined(CLOCK_BOOTTIME)
+	static clockid_t clock_id = CLOCK_BOOTTIME;
+#elif defined(CLOCK_MONOTONIC)
+	static clockid_t clock_id = CLOCK_MONOTONIC;
+#else
+	static clockid_t clock_id = CLOCK_REALTIME;
+#endif
+	struct timespec ts;
+	int res;
+
+	while (1) {
+		res = clock_gettime(clock_id, &ts);
+		if (res == 0) {
+			t->sec = ts.tv_sec;
+			t->usec = ts.tv_nsec / 1000;
+			return 0;
+		}
+		switch (clock_id) {
+#ifdef CLOCK_BOOTTIME
+		case CLOCK_BOOTTIME:
+			clock_id = CLOCK_MONOTONIC;
+			break;
+#endif
+#ifdef CLOCK_MONOTONIC
+		case CLOCK_MONOTONIC:
+			clock_id = CLOCK_REALTIME;
+			break;
+#endif
+		case CLOCK_REALTIME:
+			return -1;
+		}
+	}
 }
 
 
@@ -273,7 +310,7 @@ int os_program_init(void)
 	struct __user_cap_header_struct header;
 	struct __user_cap_data_struct cap;
 
-	setgroups(sizeof(groups)/sizeof(groups[0]), groups);
+	setgroups(ARRAY_SIZE(groups), groups);
 
 	prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0);
 
@@ -286,11 +323,8 @@ int os_program_init(void)
 		(1 << CAP_NET_ADMIN) | (1 << CAP_NET_RAW);
 	cap.inheritable = 0;
 	capset(&header, &cap);
-#endif /* defined(ANDROID) && !defined(PURE_LINUX) */
+#endif /* ANDROID && !PURE_LINUX */
 
-#ifdef WPA_TRACE
-	dl_list_init(&alloc_list);
-#endif /* WPA_TRACE */
 	return 0;
 }
 
@@ -375,6 +409,24 @@ char * os_readfile(const char *name, size_t *len)
 }
 
 
+int os_file_exists(const char *fname)
+{
+	FILE *f = fopen(fname, "rb");
+	if (f == NULL)
+		return 0;
+	fclose(f);
+	return 1;
+}
+
+
+int os_fsync(FILE *stream)
+{
+	if (!fflush(stream))
+		return fsync(fileno(stream));
+	return -1;
+}
+
+
 #ifndef WPA_TRACE
 void * os_zalloc(size_t size)
 {
@@ -408,11 +460,121 @@ size_t os_strlcpy(char *dest, const char *src, size_t siz)
 }
 
 
+int os_memcmp_const(const void *a, const void *b, size_t len)
+{
+	const u8 *aa = a;
+	const u8 *bb = b;
+	size_t i;
+	u8 res;
+
+	for (res = 0, i = 0; i < len; i++)
+		res |= aa[i] ^ bb[i];
+
+	return res;
+}
+
+
 #ifdef WPA_TRACE
+
+#if defined(WPA_TRACE_BFD) && defined(CONFIG_TESTING_OPTIONS)
+char wpa_trace_fail_func[256] = { 0 };
+unsigned int wpa_trace_fail_after;
+
+static int testing_fail_alloc(void)
+{
+	const char *func[WPA_TRACE_LEN];
+	size_t i, res, len;
+	char *pos, *next;
+	int match;
+
+	if (!wpa_trace_fail_after)
+		return 0;
+
+	res = wpa_trace_calling_func(func, WPA_TRACE_LEN);
+	i = 0;
+	if (i < res && os_strcmp(func[i], __func__) == 0)
+		i++;
+	if (i < res && os_strcmp(func[i], "os_malloc") == 0)
+		i++;
+	if (i < res && os_strcmp(func[i], "os_zalloc") == 0)
+		i++;
+	if (i < res && os_strcmp(func[i], "os_calloc") == 0)
+		i++;
+	if (i < res && os_strcmp(func[i], "os_realloc") == 0)
+		i++;
+	if (i < res && os_strcmp(func[i], "os_realloc_array") == 0)
+		i++;
+	if (i < res && os_strcmp(func[i], "os_strdup") == 0)
+		i++;
+
+	pos = wpa_trace_fail_func;
+
+	match = 0;
+	while (i < res) {
+		int allow_skip = 1;
+		int maybe = 0;
+
+		if (*pos == '=') {
+			allow_skip = 0;
+			pos++;
+		} else if (*pos == '?') {
+			maybe = 1;
+			pos++;
+		}
+		next = os_strchr(pos, ';');
+		if (next)
+			len = next - pos;
+		else
+			len = os_strlen(pos);
+		if (os_memcmp(pos, func[i], len) != 0) {
+			if (maybe && next) {
+				pos = next + 1;
+				continue;
+			}
+			if (allow_skip) {
+				i++;
+				continue;
+			}
+			return 0;
+		}
+		if (!next) {
+			match = 1;
+			break;
+		}
+		pos = next + 1;
+		i++;
+	}
+	if (!match)
+		return 0;
+
+	wpa_trace_fail_after--;
+	if (wpa_trace_fail_after == 0) {
+		wpa_printf(MSG_INFO, "TESTING: fail allocation at %s",
+			   wpa_trace_fail_func);
+		for (i = 0; i < res; i++)
+			wpa_printf(MSG_INFO, "backtrace[%d] = %s",
+				   (int) i, func[i]);
+		return 1;
+	}
+
+	return 0;
+}
+
+#else
+
+static inline int testing_fail_alloc(void)
+{
+	return 0;
+}
+#endif
 
 void * os_malloc(size_t size)
 {
 	struct os_alloc_trace *a;
+
+	if (testing_fail_alloc())
+		return NULL;
+
 	a = malloc(sizeof(*a) + size);
 	if (a == NULL)
 		return NULL;

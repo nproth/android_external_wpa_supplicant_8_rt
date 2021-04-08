@@ -13,8 +13,6 @@
 #include "utils/list.h"
 #include "eap_peer/eap_config.h"
 
-#define MAX_SSID_LEN 32
-
 
 #define DEFAULT_EAP_WORKAROUND ((unsigned int) -1)
 #define DEFAULT_EAPOL_FLAGS (EAPOL_FLAG_REQUIRE_KEY_UNICAST | \
@@ -22,17 +20,22 @@
 #define DEFAULT_PROTO (WPA_PROTO_WPA | WPA_PROTO_RSN)
 #define DEFAULT_KEY_MGMT (WPA_KEY_MGMT_PSK | WPA_KEY_MGMT_IEEE8021X)
 #define DEFAULT_PAIRWISE (WPA_CIPHER_CCMP | WPA_CIPHER_TKIP)
-#define DEFAULT_GROUP (WPA_CIPHER_CCMP | WPA_CIPHER_TKIP | \
-		       WPA_CIPHER_WEP104 | WPA_CIPHER_WEP40)
+#define DEFAULT_GROUP (WPA_CIPHER_CCMP | WPA_CIPHER_TKIP)
 #define DEFAULT_FRAGMENT_SIZE 1398
 
 #define DEFAULT_BG_SCAN_PERIOD -1
+#define DEFAULT_MESH_MAX_RETRIES 2
+#define DEFAULT_MESH_RETRY_TIMEOUT 40
+#define DEFAULT_MESH_CONFIRM_TIMEOUT 40
+#define DEFAULT_MESH_HOLDING_TIMEOUT 40
 #define DEFAULT_DISABLE_HT 0
 #define DEFAULT_DISABLE_HT40 0
 #define DEFAULT_DISABLE_SGI 0
+#define DEFAULT_DISABLE_LDPC 0
 #define DEFAULT_DISABLE_MAX_AMSDU -1 /* no change */
 #define DEFAULT_AMPDU_FACTOR -1 /* no change */
 #define DEFAULT_AMPDU_DENSITY -1 /* no change */
+#define DEFAULT_USER_SELECTED_SIM 1
 
 struct psk_list_entry {
 	struct dl_list list;
@@ -126,9 +129,26 @@ struct wpa_ssid {
 	u8 bssid[ETH_ALEN];
 
 	/**
+	 * bssid_blacklist - List of inacceptable BSSIDs
+	 */
+	u8 *bssid_blacklist;
+	size_t num_bssid_blacklist;
+
+	/**
+	 * bssid_blacklist - List of acceptable BSSIDs
+	 */
+	u8 *bssid_whitelist;
+	size_t num_bssid_whitelist;
+
+	/**
 	 * bssid_set - Whether BSSID is configured for this network
 	 */
 	int bssid_set;
+
+	/**
+	 * go_p2p_dev_addr - GO's P2P Device Address or all zeros if not set
+	 */
+	u8 go_p2p_dev_addr[ETH_ALEN];
 
 	/**
 	 * psk - WPA pre-shared key (256 bits)
@@ -156,6 +176,14 @@ struct wpa_ssid {
 	 * when requesting association with the network.
 	 */
 	char *ext_psk;
+
+	/**
+	 * mem_only_psk - Whether to keep PSK/passphrase only in memory
+	 *
+	 * 0 = allow psk/passphrase to be stored to the configuration file
+	 * 1 = do not store psk/passphrase to the configuration file
+	 */
+	int mem_only_psk;
 
 	/**
 	 * pairwise_cipher - Bitfield of allowed pairwise ciphers, WPA_CIPHER_*
@@ -310,12 +338,15 @@ struct wpa_ssid {
 	 * 4 = P2P Group Formation (used internally; not in configuration
 	 * files)
 	 *
-	 * Note: IBSS can only be used with key_mgmt NONE (plaintext and
-	 * static WEP) and key_mgmt=WPA-NONE (fixed group key TKIP/CCMP). In
-	 * addition, ap_scan has to be set to 2 for IBSS. WPA-None requires
-	 * following network block options: proto=WPA, key_mgmt=WPA-NONE,
-	 * pairwise=NONE, group=TKIP (or CCMP, but not both), and psk must also
-	 * be set (either directly or using ASCII passphrase).
+	 * 5 = Mesh
+	 *
+	 * Note: IBSS can only be used with key_mgmt NONE (plaintext and static
+	 * WEP) and WPA-PSK (with proto=RSN). In addition, key_mgmt=WPA-NONE
+	 * (fixed group key TKIP/CCMP) is available for backwards compatibility,
+	 * but its use is deprecated. WPA-None requires following network block
+	 * options: proto=WPA, key_mgmt=WPA-NONE, pairwise=NONE, group=TKIP (or
+	 * CCMP, but not both), and psk must also be set (either directly or
+	 * using ASCII passphrase).
 	 */
 	enum wpas_mode {
 		WPAS_MODE_INFRA = 0,
@@ -323,6 +354,7 @@ struct wpa_ssid {
 		WPAS_MODE_AP = 2,
 		WPAS_MODE_P2P_GO = 3,
 		WPAS_MODE_P2P_GROUP_FORMATION = 4,
+		WPAS_MODE_MESH = 5,
 	} mode;
 
 	/**
@@ -392,7 +424,28 @@ struct wpa_ssid {
 	 */
 	int frequency;
 
+	/**
+	 * fixed_freq - Use fixed frequency for IBSS
+	 */
+	int fixed_freq;
+
+	/**
+	 * mesh_basic_rates - BSS Basic rate set for mesh network
+	 *
+	 */
+	int *mesh_basic_rates;
+
+	/**
+	 * Mesh network plink parameters
+	 */
+	int dot11MeshMaxRetries;
+	int dot11MeshRetryTimeout; /* msec */
+	int dot11MeshConfirmTimeout; /* msec */
+	int dot11MeshHoldingTimeout; /* msec */
+
 	int ht40;
+
+	int vht;
 
 	/**
 	 * wpa_ptk_rekey - Maximum lifetime for PTK in seconds
@@ -491,13 +544,6 @@ struct wpa_ssid {
 	 */
 	int export_keys;
 
-#ifdef ANDROID_P2P
-	/**
-	 * assoc_retry - Number of times association should be retried.
-	 */
-	int assoc_retry;
-#endif
-
 #ifdef CONFIG_HT_OVERRIDES
 	/**
 	 * disable_ht - Disable HT (IEEE 802.11n) for this network
@@ -522,6 +568,19 @@ struct wpa_ssid {
 	 * to 1 to have it disabled.
 	 */
 	int disable_sgi;
+
+	/**
+	 * disable_ldpc - Disable LDPC for this network
+	 *
+	 * By default, use it if it is available, but this can be configured
+	 * to 1 to have it disabled.
+	 */
+	int disable_ldpc;
+
+	/**
+	 * ht40_intolerant - Indicate 40 MHz intolerant for this network
+	 */
+	int ht40_intolerant;
 
 	/**
 	 * disable_max_amsdu - Disable MAX A-MSDU
@@ -610,7 +669,7 @@ struct wpa_ssid {
 	/**
 	 * disabled_until - Network block disabled until this time if non-zero
 	 */
-	struct os_time disabled_until;
+	struct os_reltime disabled_until;
 
 	/**
 	 * parent_cred - Pointer to parent wpa_cred entry
@@ -620,6 +679,44 @@ struct wpa_ssid {
 	 * dereferences since it may not be updated in all cases.
 	 */
 	void *parent_cred;
+
+#ifdef CONFIG_MACSEC
+	/**
+	 * macsec_policy - Determines the policy for MACsec secure session
+	 *
+	 * 0: MACsec not in use (default)
+	 * 1: MACsec enabled - Should secure, accept key server's advice to
+	 *    determine whether to use a secure session or not.
+	 */
+	int macsec_policy;
+#endif /* CONFIG_MACSEC */
+
+#ifdef CONFIG_HS20
+	int update_identifier;
+#endif /* CONFIG_HS20 */
+
+	unsigned int wps_run;
+
+	/**
+	 * mac_addr - MAC address policy
+	 *
+	 * 0 = use permanent MAC address
+	 * 1 = use random MAC address for each ESS connection
+	 * 2 = like 1, but maintain OUI (with local admin bit set)
+	 *
+	 * Internally, special value -1 is used to indicate that the parameter
+	 * was not specified in the configuration (i.e., default behavior is
+	 * followed).
+	 */
+	int mac_addr;
+
+	/**
+	 * no_auto_peer - Do not automatically peer with compatible mesh peers
+	 *
+	 * When unset, the reception of a beacon from a another mesh peer in
+	 * this MBSS will trigger a peering attempt.
+	 */
+	int no_auto_peer;
 };
 
 #endif /* CONFIG_SSID_H */

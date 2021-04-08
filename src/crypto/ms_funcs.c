@@ -58,6 +58,7 @@ static int utf8_to_ucs2(const u8 *utf8_string, size_t utf8_string_len,
 				WPA_PUT_LE16(ucs2_buffer + j,
 					     ((c & 0xF) << 12) |
 					     ((c2 & 0x3F) << 6) | (c3 & 0x3F));
+				j += 2;
 			}
 		}
 	}
@@ -77,9 +78,8 @@ static int utf8_to_ucs2(const u8 *utf8_string, size_t utf8_string_len,
  * @challenge: 8-octet Challenge (OUT)
  * Returns: 0 on success, -1 on failure
  */
-static int challenge_hash(const u8 *peer_challenge, const u8 *auth_challenge,
-			  const u8 *username, size_t username_len,
-			  u8 *challenge)
+int challenge_hash(const u8 *peer_challenge, const u8 *auth_challenge,
+		   const u8 *username, size_t username_len, u8 *challenge)
 {
 	u8 hash[SHA1_MAC_LEN];
 	const unsigned char *addr[3];

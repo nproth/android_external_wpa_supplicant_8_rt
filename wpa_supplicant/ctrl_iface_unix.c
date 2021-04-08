@@ -1,6 +1,6 @@
 /*
  * WPA Supplicant / UNIX domain socket -based control interface
- * Copyright (c) 2004-2013, Jouni Malinen <j@w1.fi>
+ * Copyright (c) 2004-2014, Jouni Malinen <j@w1.fi>
  *
  * This software may be distributed under the terms of the BSD license.
  * See README for more details.
@@ -13,9 +13,13 @@
 #include <stddef.h>
 #include <unistd.h>
 #include <fcntl.h>
+#ifdef __linux__
+#include <sys/ioctl.h>
+#include <linux/sockios.h>
+#endif /* __linux__ */
 #if defined(ANDROID) && !defined(PURE_LINUX)
 #include <cutils/sockets.h>
-#endif /* defined(ANDROID) && !defined(PURE_LINUX) */
+#endif /* ANDROID && !PURE_LINUX */
 
 #include "utils/common.h"
 #include "utils/eloop.h"
@@ -47,6 +51,9 @@ struct ctrl_iface_priv {
 	struct wpa_supplicant *wpa_s;
 	int sock;
 	struct dl_list ctrl_dst;
+	int android_control_socket;
+	struct dl_list msg_queue;
+	unsigned int throttle_count;
 };
 
 
@@ -54,20 +61,66 @@ struct ctrl_iface_global_priv {
 	struct wpa_global *global;
 	int sock;
 	struct dl_list ctrl_dst;
+	int android_control_socket;
+	struct dl_list msg_queue;
+	unsigned int throttle_count;
+};
+
+struct ctrl_iface_msg {
+	struct dl_list list;
+	struct wpa_supplicant *wpa_s;
+	int level;
+	enum wpa_msg_type type;
+	const char *txt;
+	size_t len;
 };
 
 
-static void wpa_supplicant_ctrl_iface_send(const char *ifname, int sock,
+static void wpa_supplicant_ctrl_iface_send(struct wpa_supplicant *wpa_s,
+					   const char *ifname, int sock,
 					   struct dl_list *ctrl_dst,
 					   int level, const char *buf,
-					   size_t len);
+					   size_t len,
+					   struct ctrl_iface_priv *priv,
+					   struct ctrl_iface_global_priv *gp);
+static int wpas_ctrl_iface_reinit(struct wpa_supplicant *wpa_s,
+				  struct ctrl_iface_priv *priv);
+static int wpas_ctrl_iface_global_reinit(struct wpa_global *global,
+					 struct ctrl_iface_global_priv *priv);
+
+
+static void wpas_ctrl_sock_debug(const char *title, int sock, const char *buf,
+				 size_t len)
+{
+#ifdef __linux__
+	socklen_t optlen;
+	int sndbuf, outq;
+	int level = MSG_DEBUG;
+
+	if (len >= 5 && os_strncmp(buf, "PONG\n", 5) == 0)
+		level = MSG_EXCESSIVE;
+
+	optlen = sizeof(sndbuf);
+	sndbuf = 0;
+	if (getsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, &optlen) < 0)
+		sndbuf = -1;
+
+	if (ioctl(sock, SIOCOUTQ, &outq) < 0)
+		outq = -1;
+
+	wpa_printf(level,
+		   "CTRL-DEBUG: %s: sock=%d sndbuf=%d outq=%d send_len=%d",
+		   title, sock, sndbuf, outq, (int) len);
+#endif /* __linux__ */
+}
 
 
 static int wpa_supplicant_ctrl_iface_attach(struct dl_list *ctrl_dst,
 					    struct sockaddr_un *from,
-					    socklen_t fromlen)
+					    socklen_t fromlen, int global)
 {
 	struct wpa_ctrl_dst *dst;
+	char addr_txt[200];
 
 	dst = os_zalloc(sizeof(*dst));
 	if (dst == NULL)
@@ -76,9 +129,11 @@ static int wpa_supplicant_ctrl_iface_attach(struct dl_list *ctrl_dst,
 	dst->addrlen = fromlen;
 	dst->debug_level = MSG_INFO;
 	dl_list_add(ctrl_dst, &dst->list);
-	wpa_hexdump(MSG_DEBUG, "CTRL_IFACE monitor attached",
-		    (u8 *) from->sun_path,
-		    fromlen - offsetof(struct sockaddr_un, sun_path));
+	printf_encode(addr_txt, sizeof(addr_txt),
+		      (u8 *) from->sun_path,
+		      fromlen - offsetof(struct sockaddr_un, sun_path));
+	wpa_printf(MSG_DEBUG, "CTRL_IFACE %smonitor attached %s",
+		   global ? "global " : "", addr_txt);
 	return 0;
 }
 
@@ -94,10 +149,13 @@ static int wpa_supplicant_ctrl_iface_detach(struct dl_list *ctrl_dst,
 		    os_memcmp(from->sun_path, dst->addr.sun_path,
 			      fromlen - offsetof(struct sockaddr_un, sun_path))
 		    == 0) {
-			wpa_hexdump(MSG_DEBUG, "CTRL_IFACE monitor detached",
-				    (u8 *) from->sun_path,
-				    fromlen -
-				    offsetof(struct sockaddr_un, sun_path));
+			char addr_txt[200];
+			printf_encode(addr_txt, sizeof(addr_txt),
+				      (u8 *) from->sun_path,
+				      fromlen -
+				      offsetof(struct sockaddr_un, sun_path));
+			wpa_printf(MSG_DEBUG, "CTRL_IFACE monitor detached %s",
+				   addr_txt);
 			dl_list_del(&dst->list);
 			os_free(dst);
 			return 0;
@@ -121,11 +179,13 @@ static int wpa_supplicant_ctrl_iface_level(struct ctrl_iface_priv *priv,
 		    os_memcmp(from->sun_path, dst->addr.sun_path,
 			      fromlen - offsetof(struct sockaddr_un, sun_path))
 		    == 0) {
-			wpa_hexdump(MSG_DEBUG, "CTRL_IFACE changed monitor "
-				    "level", (u8 *) from->sun_path,
-				    fromlen -
-				    offsetof(struct sockaddr_un, sun_path));
+			char addr_txt[200];
 			dst->debug_level = atoi(level);
+			printf_encode(addr_txt, sizeof(addr_txt),
+				      (u8 *) from->sun_path, fromlen -
+				      offsetof(struct sockaddr_un, sun_path));
+			wpa_printf(MSG_DEBUG, "CTRL_IFACE changed monitor level to %d for %s",
+				   dst->debug_level, addr_txt);
 			return 0;
 		}
 	}
@@ -143,7 +203,7 @@ static void wpa_supplicant_ctrl_iface_receive(int sock, void *eloop_ctx,
 	int res;
 	struct sockaddr_un from;
 	socklen_t fromlen = sizeof(from);
-	char *reply = NULL;
+	char *reply = NULL, *reply_buf = NULL;
 	size_t reply_len = 0;
 	int new_attached = 0;
 
@@ -158,7 +218,7 @@ static void wpa_supplicant_ctrl_iface_receive(int sock, void *eloop_ctx,
 
 	if (os_strcmp(buf, "ATTACH") == 0) {
 		if (wpa_supplicant_ctrl_iface_attach(&priv->ctrl_dst, &from,
-						     fromlen))
+						     fromlen, 0))
 			reply_len = 1;
 		else {
 			new_attached = 1;
@@ -177,21 +237,58 @@ static void wpa_supplicant_ctrl_iface_receive(int sock, void *eloop_ctx,
 		else
 			reply_len = 2;
 	} else {
-		reply = wpa_supplicant_ctrl_iface_process(wpa_s, buf,
-							  &reply_len);
+		reply_buf = wpa_supplicant_ctrl_iface_process(wpa_s, buf,
+							      &reply_len);
+		reply = reply_buf;
+
+		/*
+		 * There could be some password/key material in the command, so
+		 * clear the buffer explicitly now that it is not needed
+		 * anymore.
+		 */
+		os_memset(buf, 0, res);
+	}
+
+	if (!reply && reply_len == 1) {
+		reply = "FAIL\n";
+		reply_len = 5;
+	} else if (!reply && reply_len == 2) {
+		reply = "OK\n";
+		reply_len = 3;
 	}
 
 	if (reply) {
-		sendto(sock, reply, reply_len, 0, (struct sockaddr *) &from,
-		       fromlen);
-		os_free(reply);
-	} else if (reply_len == 1) {
-		sendto(sock, "FAIL\n", 5, 0, (struct sockaddr *) &from,
-		       fromlen);
-	} else if (reply_len == 2) {
-		sendto(sock, "OK\n", 3, 0, (struct sockaddr *) &from,
-		       fromlen);
+		wpas_ctrl_sock_debug("ctrl_sock-sendto", sock, reply,
+				     reply_len);
+		if (sendto(sock, reply, reply_len, 0, (struct sockaddr *) &from,
+			   fromlen) < 0) {
+			int _errno = errno;
+			wpa_dbg(wpa_s, MSG_DEBUG,
+				"ctrl_iface sendto failed: %d - %s",
+				_errno, strerror(_errno));
+			if (_errno == ENOBUFS || _errno == EAGAIN) {
+				/*
+				 * The socket send buffer could be full. This
+				 * may happen if client programs are not
+				 * receiving their pending messages. Close and
+				 * reopen the socket as a workaround to avoid
+				 * getting stuck being unable to send any new
+				 * responses.
+				 */
+				sock = wpas_ctrl_iface_reinit(wpa_s, priv);
+				if (sock < 0) {
+					wpa_dbg(wpa_s, MSG_DEBUG, "Failed to reinitialize ctrl_iface socket");
+				}
+			}
+			if (new_attached) {
+				wpa_dbg(wpa_s, MSG_DEBUG, "Failed to send response to ATTACH - detaching");
+				new_attached = 0;
+				wpa_supplicant_ctrl_iface_detach(
+					&priv->ctrl_dst, &from, fromlen);
+			}
+		}
 	}
+	os_free(reply_buf);
 
 	if (new_attached)
 		eapol_sm_notify_ctrl_attached(wpa_s->eapol);
@@ -202,7 +299,7 @@ static char * wpa_supplicant_ctrl_iface_path(struct wpa_supplicant *wpa_s)
 {
 	char *buf;
 	size_t len;
-	char *pbuf, *dir = NULL, *gid_str = NULL;
+	char *pbuf, *dir = NULL;
 	int res;
 
 	if (wpa_s->conf->ctrl_interface == NULL)
@@ -212,12 +309,11 @@ static char * wpa_supplicant_ctrl_iface_path(struct wpa_supplicant *wpa_s)
 	if (pbuf == NULL)
 		return NULL;
 	if (os_strncmp(pbuf, "DIR=", 4) == 0) {
+		char *gid_str;
 		dir = pbuf + 4;
 		gid_str = os_strstr(dir, " GROUP=");
-		if (gid_str) {
+		if (gid_str)
 			*gid_str = '\0';
-			gid_str += 7;
-		}
 	} else
 		dir = pbuf;
 
@@ -229,7 +325,7 @@ static char * wpa_supplicant_ctrl_iface_path(struct wpa_supplicant *wpa_s)
 	}
 
 	res = os_snprintf(buf, len, "%s/%s", dir, wpa_s->ifname);
-	if (res < 0 || (size_t) res >= len) {
+	if (os_snprintf_error(len, res)) {
 		os_free(pbuf);
 		os_free(buf);
 		return NULL;
@@ -251,37 +347,215 @@ static char * wpa_supplicant_ctrl_iface_path(struct wpa_supplicant *wpa_s)
 }
 
 
-static void wpa_supplicant_ctrl_iface_msg_cb(void *ctx, int level, int global,
+static int wpas_ctrl_iface_throttle(int sock)
+{
+#ifdef __linux__
+	socklen_t optlen;
+	int sndbuf, outq;
+
+	optlen = sizeof(sndbuf);
+	sndbuf = 0;
+	if (getsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, &optlen) < 0 ||
+	    ioctl(sock, SIOCOUTQ, &outq) < 0 ||
+	    sndbuf <= 0 || outq < 0)
+		return 0;
+	return outq > sndbuf / 2;
+#else /* __linux__ */
+	return 0;
+#endif /* __linux__ */
+}
+
+
+static void wpas_ctrl_msg_send_pending_global(struct wpa_global *global)
+{
+	struct ctrl_iface_global_priv *gpriv;
+	struct ctrl_iface_msg *msg;
+
+	gpriv = global->ctrl_iface;
+	while (gpriv && !dl_list_empty(&gpriv->msg_queue) &&
+	       !wpas_ctrl_iface_throttle(gpriv->sock)) {
+		msg = dl_list_first(&gpriv->msg_queue, struct ctrl_iface_msg,
+				    list);
+		if (!msg)
+			break;
+		dl_list_del(&msg->list);
+		wpa_supplicant_ctrl_iface_send(
+			msg->wpa_s,
+			msg->type != WPA_MSG_PER_INTERFACE ?
+			NULL : msg->wpa_s->ifname,
+			gpriv->sock, &gpriv->ctrl_dst, msg->level,
+			msg->txt, msg->len, NULL, gpriv);
+		os_free(msg);
+	}
+}
+
+
+static void wpas_ctrl_msg_send_pending_iface(struct wpa_supplicant *wpa_s)
+{
+	struct ctrl_iface_priv *priv;
+	struct ctrl_iface_msg *msg;
+
+	priv = wpa_s->ctrl_iface;
+	while (priv && !dl_list_empty(&priv->msg_queue) &&
+	       !wpas_ctrl_iface_throttle(priv->sock)) {
+		msg = dl_list_first(&priv->msg_queue, struct ctrl_iface_msg,
+				    list);
+		if (!msg)
+			break;
+		dl_list_del(&msg->list);
+		wpa_supplicant_ctrl_iface_send(wpa_s, NULL, priv->sock,
+					       &priv->ctrl_dst, msg->level,
+					       msg->txt, msg->len, priv, NULL);
+		os_free(msg);
+	}
+}
+
+
+static void wpas_ctrl_msg_queue_timeout(void *eloop_ctx, void *timeout_ctx)
+{
+	struct wpa_supplicant *wpa_s = eloop_ctx;
+	struct ctrl_iface_priv *priv;
+	struct ctrl_iface_global_priv *gpriv;
+	int sock = -1, gsock = -1;
+
+	wpas_ctrl_msg_send_pending_global(wpa_s->global);
+	wpas_ctrl_msg_send_pending_iface(wpa_s);
+
+	priv = wpa_s->ctrl_iface;
+	if (priv && !dl_list_empty(&priv->msg_queue))
+		sock = priv->sock;
+
+	gpriv = wpa_s->global->ctrl_iface;
+	if (gpriv && !dl_list_empty(&gpriv->msg_queue))
+		gsock = gpriv->sock;
+
+	if (sock > -1 || gsock > -1) {
+		/* Continue pending message transmission from a timeout */
+		wpa_printf(MSG_MSGDUMP,
+			   "CTRL: Had to throttle pending event message transmission for (sock %d gsock %d)",
+			   sock, gsock);
+		eloop_register_timeout(0, 20000, wpas_ctrl_msg_queue_timeout,
+				       wpa_s, NULL);
+	}
+}
+
+
+static void wpas_ctrl_msg_queue(struct dl_list *queue,
+				struct wpa_supplicant *wpa_s, int level,
+				enum wpa_msg_type type,
+				const char *txt, size_t len)
+{
+	struct ctrl_iface_msg *msg;
+
+	msg = os_zalloc(sizeof(*msg) + len);
+	if (!msg)
+		return;
+
+	msg->wpa_s = wpa_s;
+	msg->level = level;
+	msg->type = type;
+	os_memcpy(msg + 1, txt, len);
+	msg->txt = (const char *) (msg + 1);
+	msg->len = len;
+	dl_list_add_tail(queue, &msg->list);
+	eloop_cancel_timeout(wpas_ctrl_msg_queue_timeout, wpa_s, NULL);
+	eloop_register_timeout(0, 0, wpas_ctrl_msg_queue_timeout, wpa_s, NULL);
+}
+
+
+static void wpas_ctrl_msg_queue_limit(unsigned int throttle_count,
+				      struct dl_list *queue)
+{
+	struct ctrl_iface_msg *msg;
+
+	if (throttle_count < 2000)
+		return;
+
+	msg = dl_list_first(queue, struct ctrl_iface_msg, list);
+	if (msg) {
+		wpa_printf(MSG_DEBUG, "CTRL: Dropped oldest pending message");
+		dl_list_del(&msg->list);
+		os_free(msg);
+	}
+}
+
+
+static void wpa_supplicant_ctrl_iface_msg_cb(void *ctx, int level,
+					     enum wpa_msg_type type,
 					     const char *txt, size_t len)
 {
 	struct wpa_supplicant *wpa_s = ctx;
+	struct ctrl_iface_priv *priv;
+	struct ctrl_iface_global_priv *gpriv;
 
 	if (wpa_s == NULL)
 		return;
 
-	if (global != 2 && wpa_s->global->ctrl_iface) {
-		struct ctrl_iface_global_priv *priv = wpa_s->global->ctrl_iface;
-		if (!dl_list_empty(&priv->ctrl_dst)) {
-			wpa_supplicant_ctrl_iface_send(global ? NULL :
-						       wpa_s->ifname,
-						       priv->sock,
-						       &priv->ctrl_dst,
-						       level, txt, len);
+	gpriv = wpa_s->global->ctrl_iface;
+
+	if (type != WPA_MSG_NO_GLOBAL && gpriv &&
+	    !dl_list_empty(&gpriv->ctrl_dst)) {
+		if (!dl_list_empty(&gpriv->msg_queue) ||
+		    wpas_ctrl_iface_throttle(gpriv->sock)) {
+			if (gpriv->throttle_count == 0) {
+				wpa_printf(MSG_MSGDUMP,
+					   "CTRL: Had to throttle global event message for sock %d",
+					   gpriv->sock);
+			}
+			gpriv->throttle_count++;
+			wpas_ctrl_msg_queue_limit(gpriv->throttle_count,
+						  &gpriv->msg_queue);
+			wpas_ctrl_msg_queue(&gpriv->msg_queue, wpa_s, level,
+					    type, txt, len);
+		} else {
+			if (gpriv->throttle_count) {
+				wpa_printf(MSG_MSGDUMP,
+					   "CTRL: Had to throttle %u global event message(s) for sock %d",
+					   gpriv->throttle_count, gpriv->sock);
+			}
+			gpriv->throttle_count = 0;
+			wpa_supplicant_ctrl_iface_send(
+				wpa_s,
+				type != WPA_MSG_PER_INTERFACE ?
+				NULL : wpa_s->ifname,
+				gpriv->sock, &gpriv->ctrl_dst, level,
+				txt, len, NULL, gpriv);
 		}
 	}
 
-	if (wpa_s->ctrl_iface == NULL)
-		return;
-	wpa_supplicant_ctrl_iface_send(NULL, wpa_s->ctrl_iface->sock,
-				       &wpa_s->ctrl_iface->ctrl_dst,
-				       level, txt, len);
+	priv = wpa_s->ctrl_iface;
+
+	if (type != WPA_MSG_ONLY_GLOBAL && priv) {
+		if (!dl_list_empty(&priv->msg_queue) ||
+		    wpas_ctrl_iface_throttle(priv->sock)) {
+			if (priv->throttle_count == 0) {
+				wpa_printf(MSG_MSGDUMP,
+					   "CTRL: Had to throttle event message for sock %d",
+					   priv->sock);
+			}
+			priv->throttle_count++;
+			wpas_ctrl_msg_queue_limit(priv->throttle_count,
+						  &priv->msg_queue);
+			wpas_ctrl_msg_queue(&priv->msg_queue, wpa_s, level,
+					    type, txt, len);
+		} else {
+			if (priv->throttle_count) {
+				wpa_printf(MSG_MSGDUMP,
+					   "CTRL: Had to throttle %u event message(s) for sock %d",
+					   priv->throttle_count, priv->sock);
+			}
+			priv->throttle_count = 0;
+			wpa_supplicant_ctrl_iface_send(wpa_s, NULL, priv->sock,
+						       &priv->ctrl_dst, level,
+						       txt, len, priv, NULL);
+		}
+	}
 }
 
 
-struct ctrl_iface_priv *
-wpa_supplicant_ctrl_iface_init(struct wpa_supplicant *wpa_s)
+static int wpas_ctrl_iface_open_sock(struct wpa_supplicant *wpa_s,
+				     struct ctrl_iface_priv *priv)
 {
-	struct ctrl_iface_priv *priv;
 	struct sockaddr_un addr;
 	char *fname = NULL;
 	gid_t gid = 0;
@@ -291,16 +565,6 @@ wpa_supplicant_ctrl_iface_init(struct wpa_supplicant *wpa_s)
 	char *endp;
 	int flags;
 
-	priv = os_zalloc(sizeof(*priv));
-	if (priv == NULL)
-		return NULL;
-	dl_list_init(&priv->ctrl_dst);
-	priv->wpa_s = wpa_s;
-	priv->sock = -1;
-
-	if (wpa_s->conf->ctrl_interface == NULL)
-		return priv;
-
 	buf = os_strdup(wpa_s->conf->ctrl_interface);
 	if (buf == NULL)
 		goto fail;
@@ -308,9 +572,11 @@ wpa_supplicant_ctrl_iface_init(struct wpa_supplicant *wpa_s)
 	os_snprintf(addr.sun_path, sizeof(addr.sun_path), "wpa_%s",
 		    wpa_s->conf->ctrl_interface);
 	priv->sock = android_get_control_socket(addr.sun_path);
-	if (priv->sock >= 0)
+	if (priv->sock >= 0) {
+		priv->android_control_socket = 1;
 		goto havesock;
-#endif /* defined(ANDROID) && !defined(PURE_LINUX) */
+	}
+#endif /* ANDROID && !PURE_LINUX */
 	if (os_strncmp(buf, "DIR=", 4) == 0) {
 		dir = buf + 4;
 		gid_str = os_strstr(dir, " GROUP=");
@@ -455,7 +721,7 @@ wpa_supplicant_ctrl_iface_init(struct wpa_supplicant *wpa_s)
 
 #if defined(ANDROID) && !defined(PURE_LINUX)
 havesock:
-#endif /* defined(ANDROID) && !defined(PURE_LINUX) */
+#endif /* ANDROID && !PURE_LINUX */
 
 	/*
 	 * Make socket non-blocking so that we don't hang forever if
@@ -476,28 +742,84 @@ havesock:
 	wpa_msg_register_cb(wpa_supplicant_ctrl_iface_msg_cb);
 
 	os_free(buf);
-	return priv;
+	return 0;
 
 fail:
-	if (priv->sock >= 0)
+	if (priv->sock >= 0) {
 		close(priv->sock);
-	os_free(priv);
+		priv->sock = -1;
+	}
 	if (fname) {
 		unlink(fname);
 		os_free(fname);
 	}
 	os_free(buf);
-	return NULL;
+	return -1;
+}
+
+
+struct ctrl_iface_priv *
+wpa_supplicant_ctrl_iface_init(struct wpa_supplicant *wpa_s)
+{
+	struct ctrl_iface_priv *priv;
+
+	priv = os_zalloc(sizeof(*priv));
+	if (priv == NULL)
+		return NULL;
+	dl_list_init(&priv->ctrl_dst);
+	dl_list_init(&priv->msg_queue);
+	priv->wpa_s = wpa_s;
+	priv->sock = -1;
+
+	if (wpa_s->conf->ctrl_interface == NULL)
+		return priv;
+
+	if (wpas_ctrl_iface_open_sock(wpa_s, priv) < 0) {
+		os_free(priv);
+		return NULL;
+	}
+
+	return priv;
+}
+
+
+static int wpas_ctrl_iface_reinit(struct wpa_supplicant *wpa_s,
+				  struct ctrl_iface_priv *priv)
+{
+	int res;
+
+	if (priv->sock <= 0)
+		return -1;
+
+	/*
+	 * On Android, the control socket being used may be the socket
+	 * that is created when wpa_supplicant is started as a /init.*.rc
+	 * service. Such a socket is maintained as a key-value pair in
+	 * Android's environment. Closing this control socket would leave us
+	 * in a bad state with an invalid socket descriptor.
+	 */
+	if (priv->android_control_socket)
+		return priv->sock;
+
+	eloop_unregister_read_sock(priv->sock);
+	close(priv->sock);
+	priv->sock = -1;
+	res = wpas_ctrl_iface_open_sock(wpa_s, priv);
+	if (res < 0)
+		return -1;
+	return priv->sock;
 }
 
 
 void wpa_supplicant_ctrl_iface_deinit(struct ctrl_iface_priv *priv)
 {
 	struct wpa_ctrl_dst *dst, *prev;
+	struct ctrl_iface_msg *msg, *prev_msg;
+	struct ctrl_iface_global_priv *gpriv;
 
 	if (priv->sock > -1) {
 		char *fname;
-		char *buf, *dir = NULL, *gid_str = NULL;
+		char *buf, *dir = NULL;
 		eloop_unregister_read_sock(priv->sock);
 		if (!dl_list_empty(&priv->ctrl_dst)) {
 			/*
@@ -517,16 +839,17 @@ void wpa_supplicant_ctrl_iface_deinit(struct ctrl_iface_priv *priv)
 			os_free(fname);
 		}
 
+		if (priv->wpa_s->conf->ctrl_interface == NULL)
+			goto free_dst;
 		buf = os_strdup(priv->wpa_s->conf->ctrl_interface);
 		if (buf == NULL)
 			goto free_dst;
 		if (os_strncmp(buf, "DIR=", 4) == 0) {
+			char *gid_str;
 			dir = buf + 4;
 			gid_str = os_strstr(dir, " GROUP=");
-			if (gid_str) {
+			if (gid_str)
 				*gid_str = '\0';
-				gid_str += 7;
-			}
 		} else
 			dir = buf;
 
@@ -548,6 +871,22 @@ free_dst:
 	dl_list_for_each_safe(dst, prev, &priv->ctrl_dst, struct wpa_ctrl_dst,
 			      list)
 		os_free(dst);
+	dl_list_for_each_safe(msg, prev_msg, &priv->msg_queue,
+			      struct ctrl_iface_msg, list) {
+		dl_list_del(&msg->list);
+		os_free(msg);
+	}
+	gpriv = priv->wpa_s->global->ctrl_iface;
+	if (gpriv) {
+		dl_list_for_each_safe(msg, prev_msg, &gpriv->msg_queue,
+				      struct ctrl_iface_msg, list) {
+			if (msg->wpa_s == priv->wpa_s) {
+				dl_list_del(&msg->list);
+				os_free(msg);
+			}
+		}
+	}
+	eloop_cancel_timeout(wpas_ctrl_msg_queue_timeout, priv->wpa_s, NULL);
 	os_free(priv);
 }
 
@@ -563,10 +902,13 @@ free_dst:
  *
  * Send a packet to all monitor programs attached to the control interface.
  */
-static void wpa_supplicant_ctrl_iface_send(const char *ifname, int sock,
+static void wpa_supplicant_ctrl_iface_send(struct wpa_supplicant *wpa_s,
+					   const char *ifname, int sock,
 					   struct dl_list *ctrl_dst,
 					   int level, const char *buf,
-					   size_t len)
+					   size_t len,
+					   struct ctrl_iface_priv *priv,
+					   struct ctrl_iface_global_priv *gp)
 {
 	struct wpa_ctrl_dst *dst, *next;
 	char levelstr[10];
@@ -578,7 +920,7 @@ static void wpa_supplicant_ctrl_iface_send(const char *ifname, int sock,
 		return;
 
 	res = os_snprintf(levelstr, sizeof(levelstr), "<%d>", level);
-	if (res < 0 || (size_t) res >= sizeof(levelstr))
+	if (os_snprintf_error(sizeof(levelstr), res))
 		return;
 	idx = 0;
 	if (ifname) {
@@ -602,31 +944,59 @@ static void wpa_supplicant_ctrl_iface_send(const char *ifname, int sock,
 	msg.msg_iov = io;
 	msg.msg_iovlen = idx;
 
-	idx = 0;
 	dl_list_for_each_safe(dst, next, ctrl_dst, struct wpa_ctrl_dst, list) {
-		if (level >= dst->debug_level) {
-			wpa_hexdump(MSG_DEBUG, "CTRL_IFACE monitor send",
-				    (u8 *) dst->addr.sun_path, dst->addrlen -
-				    offsetof(struct sockaddr_un, sun_path));
-			msg.msg_name = (void *) &dst->addr;
-			msg.msg_namelen = dst->addrlen;
-			if (sendmsg(sock, &msg, MSG_DONTWAIT) < 0) {
-				int _errno = errno;
-				wpa_printf(MSG_INFO, "CTRL_IFACE monitor[%d]: "
-					   "%d - %s",
-					   idx, errno, strerror(errno));
-				dst->errors++;
-				if (dst->errors > 1000 ||
-				    (_errno != ENOBUFS && dst->errors > 10) ||
-				    _errno == ENOENT) {
-					wpa_supplicant_ctrl_iface_detach(
-						ctrl_dst, &dst->addr,
-						dst->addrlen);
-				}
-			} else
-				dst->errors = 0;
+		int _errno;
+		char addr_txt[200];
+
+		if (level < dst->debug_level)
+			continue;
+
+		printf_encode(addr_txt, sizeof(addr_txt),
+			      (u8 *) dst->addr.sun_path, dst->addrlen -
+			      offsetof(struct sockaddr_un, sun_path));
+		msg.msg_name = (void *) &dst->addr;
+		msg.msg_namelen = dst->addrlen;
+		wpas_ctrl_sock_debug("ctrl_sock-sendmsg", sock, buf, len);
+		if (sendmsg(sock, &msg, MSG_DONTWAIT) >= 0) {
+			wpa_printf(MSG_DEBUG, "CTRL_IFACE monitor sent successfully to %s",
+				   addr_txt);
+			dst->errors = 0;
+			continue;
 		}
-		idx++;
+
+		_errno = errno;
+		wpa_printf(MSG_DEBUG, "CTRL_IFACE monitor[%s]: %d - %s",
+			   addr_txt, errno, strerror(errno));
+		dst->errors++;
+
+		if (dst->errors > 10 || _errno == ENOENT || _errno == EPERM) {
+			wpa_printf(MSG_INFO, "CTRL_IFACE: Detach monitor %s that cannot receive messages",
+				addr_txt);
+			wpa_supplicant_ctrl_iface_detach(ctrl_dst, &dst->addr,
+							 dst->addrlen);
+		}
+
+		if (_errno == ENOBUFS || _errno == EAGAIN) {
+			/*
+			 * The socket send buffer could be full. This may happen
+			 * if client programs are not receiving their pending
+			 * messages. Close and reopen the socket as a workaround
+			 * to avoid getting stuck being unable to send any new
+			 * responses.
+			 */
+			if (priv)
+				sock = wpas_ctrl_iface_reinit(wpa_s, priv);
+			else if (gp)
+				sock = wpas_ctrl_iface_global_reinit(
+					wpa_s->global, gp);
+			else
+				break;
+			if (sock < 0) {
+				wpa_dbg(wpa_s, MSG_DEBUG,
+					"Failed to reinitialize ctrl_iface socket");
+				break;
+			}
+		}
 	}
 }
 
@@ -655,19 +1025,32 @@ void wpa_supplicant_ctrl_iface_wait(struct ctrl_iface_priv *priv)
 		if (os_strcmp(buf, "ATTACH") == 0) {
 			/* handle ATTACH signal of first monitor interface */
 			if (!wpa_supplicant_ctrl_iface_attach(&priv->ctrl_dst,
-							      &from, fromlen)) {
-				sendto(priv->sock, "OK\n", 3, 0,
-				       (struct sockaddr *) &from, fromlen);
+							      &from, fromlen,
+							      0)) {
+				if (sendto(priv->sock, "OK\n", 3, 0,
+					   (struct sockaddr *) &from, fromlen) <
+				    0) {
+					wpa_printf(MSG_DEBUG, "ctrl_iface sendto failed: %s",
+						   strerror(errno));
+				}
 				/* OK to continue */
 				return;
 			} else {
-				sendto(priv->sock, "FAIL\n", 5, 0,
-				       (struct sockaddr *) &from, fromlen);
+				if (sendto(priv->sock, "FAIL\n", 5, 0,
+					   (struct sockaddr *) &from, fromlen) <
+				    0) {
+					wpa_printf(MSG_DEBUG, "ctrl_iface sendto failed: %s",
+						   strerror(errno));
+				}
 			}
 		} else {
 			/* return FAIL for all other signals */
-			sendto(priv->sock, "FAIL\n", 5, 0,
-			       (struct sockaddr *) &from, fromlen);
+			if (sendto(priv->sock, "FAIL\n", 5, 0,
+				   (struct sockaddr *) &from, fromlen) < 0) {
+				wpa_printf(MSG_DEBUG,
+					   "ctrl_iface sendto failed: %s",
+					   strerror(errno));
+			}
 		}
 	}
 }
@@ -680,11 +1063,11 @@ static void wpa_supplicant_global_ctrl_iface_receive(int sock, void *eloop_ctx,
 {
 	struct wpa_global *global = eloop_ctx;
 	struct ctrl_iface_global_priv *priv = sock_ctx;
-	char buf[256];
+	char buf[4096];
 	int res;
 	struct sockaddr_un from;
 	socklen_t fromlen = sizeof(from);
-	char *reply = NULL;
+	char *reply = NULL, *reply_buf = NULL;
 	size_t reply_len;
 
 	res = recvfrom(sock, buf, sizeof(buf) - 1, 0,
@@ -698,7 +1081,7 @@ static void wpa_supplicant_global_ctrl_iface_receive(int sock, void *eloop_ctx,
 
 	if (os_strcmp(buf, "ATTACH") == 0) {
 		if (wpa_supplicant_ctrl_iface_attach(&priv->ctrl_dst, &from,
-						     fromlen))
+						     fromlen, 1))
 			reply_len = 1;
 		else
 			reply_len = 2;
@@ -709,40 +1092,45 @@ static void wpa_supplicant_global_ctrl_iface_receive(int sock, void *eloop_ctx,
 		else
 			reply_len = 2;
 	} else {
-		reply = wpa_supplicant_global_ctrl_iface_process(global, buf,
-								 &reply_len);
+		reply_buf = wpa_supplicant_global_ctrl_iface_process(
+			global, buf, &reply_len);
+		reply = reply_buf;
+
+		/*
+		 * There could be some password/key material in the command, so
+		 * clear the buffer explicitly now that it is not needed
+		 * anymore.
+		 */
+		os_memset(buf, 0, res);
+	}
+
+	if (!reply && reply_len == 1) {
+		reply = "FAIL\n";
+		reply_len = 5;
+	} else if (!reply && reply_len == 2) {
+		reply = "OK\n";
+		reply_len = 3;
 	}
 
 	if (reply) {
-		sendto(sock, reply, reply_len, 0, (struct sockaddr *) &from,
-		       fromlen);
-		os_free(reply);
-	} else if (reply_len == 1) {
-		sendto(sock, "FAIL\n", 5, 0, (struct sockaddr *) &from,
-		       fromlen);
-	} else if (reply_len == 2) {
-		sendto(sock, "OK\n", 3, 0, (struct sockaddr *) &from, fromlen);
+		wpas_ctrl_sock_debug("global_ctrl_sock-sendto",
+				     sock, reply, reply_len);
+		if (sendto(sock, reply, reply_len, 0, (struct sockaddr *) &from,
+			   fromlen) < 0) {
+			wpa_printf(MSG_DEBUG, "ctrl_iface sendto failed: %s",
+				strerror(errno));
+		}
 	}
+	os_free(reply_buf);
 }
 
 
-struct ctrl_iface_global_priv *
-wpa_supplicant_global_ctrl_iface_init(struct wpa_global *global)
+static int wpas_global_ctrl_iface_open_sock(struct wpa_global *global,
+					    struct ctrl_iface_global_priv *priv)
 {
-	struct ctrl_iface_global_priv *priv;
 	struct sockaddr_un addr;
 	const char *ctrl = global->params.ctrl_interface;
 	int flags;
-
-	priv = os_zalloc(sizeof(*priv));
-	if (priv == NULL)
-		return NULL;
-	dl_list_init(&priv->ctrl_dst);
-	priv->global = global;
-	priv->sock = -1;
-
-	if (ctrl == NULL)
-		return priv;
 
 	wpa_printf(MSG_DEBUG, "Global control interface '%s'", ctrl);
 
@@ -756,6 +1144,7 @@ wpa_supplicant_global_ctrl_iface_init(struct wpa_global *global)
 		}
 		wpa_printf(MSG_DEBUG, "Using Android control socket '%s'",
 			   ctrl + 9);
+		priv->android_control_socket = 1;
 		goto havesock;
 	}
 
@@ -770,10 +1159,11 @@ wpa_supplicant_global_ctrl_iface_init(struct wpa_global *global)
 			wpa_printf(MSG_DEBUG,
 				   "Using Android control socket '%s'",
 				   ctrl);
+			priv->android_control_socket = 1;
 			goto havesock;
 		}
 	}
-#endif /* defined(ANDROID) && !defined(PURE_LINUX) */
+#endif /* ANDROID && !PURE_LINUX */
 
 	priv->sock = socket(PF_UNIX, SOCK_DGRAM, 0);
 	if (priv->sock < 0) {
@@ -876,7 +1266,13 @@ wpa_supplicant_global_ctrl_iface_init(struct wpa_global *global)
 			goto fail;
 		}
 	} else {
-		chmod(ctrl, S_IRWXU);
+		if (chmod(ctrl, S_IRWXU) < 0) {
+			wpa_printf(MSG_DEBUG,
+				   "chmod[global_ctrl_interface=%s](S_IRWXU): %s",
+				   ctrl, strerror(errno));
+			/* continue anyway since group change was not required
+			 */
+		}
 	}
 
 havesock:
@@ -899,13 +1295,69 @@ havesock:
 				 wpa_supplicant_global_ctrl_iface_receive,
 				 global, priv);
 
-	return priv;
+	return 0;
 
 fail:
-	if (priv->sock >= 0)
+	if (priv->sock >= 0) {
 		close(priv->sock);
-	os_free(priv);
-	return NULL;
+		priv->sock = -1;
+	}
+	return -1;
+}
+
+
+struct ctrl_iface_global_priv *
+wpa_supplicant_global_ctrl_iface_init(struct wpa_global *global)
+{
+	struct ctrl_iface_global_priv *priv;
+
+	priv = os_zalloc(sizeof(*priv));
+	if (priv == NULL)
+		return NULL;
+	dl_list_init(&priv->ctrl_dst);
+	dl_list_init(&priv->msg_queue);
+	priv->global = global;
+	priv->sock = -1;
+
+	if (global->params.ctrl_interface == NULL)
+		return priv;
+
+	if (wpas_global_ctrl_iface_open_sock(global, priv) < 0) {
+		os_free(priv);
+		return NULL;
+	}
+
+	wpa_msg_register_cb(wpa_supplicant_ctrl_iface_msg_cb);
+
+	return priv;
+}
+
+
+static int wpas_ctrl_iface_global_reinit(struct wpa_global *global,
+					 struct ctrl_iface_global_priv *priv)
+{
+	int res;
+
+	if (priv->sock <= 0)
+		return -1;
+
+	/*
+	 * On Android, the control socket being used may be the socket
+	 * that is created when wpa_supplicant is started as a /init.*.rc
+	 * service. Such a socket is maintained as a key-value pair in
+	 * Android's environment. Closing this control socket would leave us
+	 * in a bad state with an invalid socket descriptor.
+	 */
+	if (priv->android_control_socket)
+		return priv->sock;
+
+	eloop_unregister_read_sock(priv->sock);
+	close(priv->sock);
+	priv->sock = -1;
+	res = wpas_global_ctrl_iface_open_sock(global, priv);
+	if (res < 0)
+		return -1;
+	return priv->sock;
 }
 
 
@@ -913,6 +1365,7 @@ void
 wpa_supplicant_global_ctrl_iface_deinit(struct ctrl_iface_global_priv *priv)
 {
 	struct wpa_ctrl_dst *dst, *prev;
+	struct ctrl_iface_msg *msg, *prev_msg;
 
 	if (priv->sock >= 0) {
 		eloop_unregister_read_sock(priv->sock);
@@ -923,5 +1376,10 @@ wpa_supplicant_global_ctrl_iface_deinit(struct ctrl_iface_global_priv *priv)
 	dl_list_for_each_safe(dst, prev, &priv->ctrl_dst, struct wpa_ctrl_dst,
 			      list)
 		os_free(dst);
+	dl_list_for_each_safe(msg, prev_msg, &priv->msg_queue,
+			      struct ctrl_iface_msg, list) {
+		dl_list_del(&msg->list);
+		os_free(msg);
+	}
 	os_free(priv);
 }

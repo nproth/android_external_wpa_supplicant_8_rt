@@ -1,6 +1,6 @@
 /*
  * WPA Supplicant - Common definitions
- * Copyright (c) 2004-2008, Jouni Malinen <j@w1.fi>
+ * Copyright (c) 2004-2015, Jouni Malinen <j@w1.fi>
  *
  * This software may be distributed under the terms of the BSD license.
  * See README for more details.
@@ -48,13 +48,19 @@ typedef enum { FALSE = 0, TRUE = 1 } Boolean;
 #define WPA_KEY_MGMT_WAPI_PSK BIT(12)
 #define WPA_KEY_MGMT_WAPI_CERT BIT(13)
 #define WPA_KEY_MGMT_CCKM BIT(14)
+#define WPA_KEY_MGMT_OSEN BIT(15)
+#define WPA_KEY_MGMT_IEEE8021X_SUITE_B BIT(16)
+#define WPA_KEY_MGMT_IEEE8021X_SUITE_B_192 BIT(17)
 
 static inline int wpa_key_mgmt_wpa_ieee8021x(int akm)
 {
 	return !!(akm & (WPA_KEY_MGMT_IEEE8021X |
 			 WPA_KEY_MGMT_FT_IEEE8021X |
 			 WPA_KEY_MGMT_CCKM |
-			 WPA_KEY_MGMT_IEEE8021X_SHA256));
+			 WPA_KEY_MGMT_OSEN |
+			 WPA_KEY_MGMT_IEEE8021X_SHA256 |
+			 WPA_KEY_MGMT_IEEE8021X_SUITE_B |
+			 WPA_KEY_MGMT_IEEE8021X_SUITE_B_192));
 }
 
 static inline int wpa_key_mgmt_wpa_psk(int akm)
@@ -62,7 +68,8 @@ static inline int wpa_key_mgmt_wpa_psk(int akm)
 	return !!(akm & (WPA_KEY_MGMT_PSK |
 			 WPA_KEY_MGMT_FT_PSK |
 			 WPA_KEY_MGMT_PSK_SHA256 |
-			 WPA_KEY_MGMT_SAE));
+			 WPA_KEY_MGMT_SAE |
+			 WPA_KEY_MGMT_FT_SAE));
 }
 
 static inline int wpa_key_mgmt_ft(int akm)
@@ -81,13 +88,27 @@ static inline int wpa_key_mgmt_sae(int akm)
 static inline int wpa_key_mgmt_sha256(int akm)
 {
 	return !!(akm & (WPA_KEY_MGMT_PSK_SHA256 |
-			 WPA_KEY_MGMT_IEEE8021X_SHA256));
+			 WPA_KEY_MGMT_IEEE8021X_SHA256 |
+			 WPA_KEY_MGMT_OSEN |
+			 WPA_KEY_MGMT_IEEE8021X_SUITE_B));
+}
+
+static inline int wpa_key_mgmt_sha384(int akm)
+{
+	return !!(akm & WPA_KEY_MGMT_IEEE8021X_SUITE_B_192);
+}
+
+static inline int wpa_key_mgmt_suite_b(int akm)
+{
+	return !!(akm & (WPA_KEY_MGMT_IEEE8021X_SUITE_B |
+			 WPA_KEY_MGMT_IEEE8021X_SUITE_B_192));
 }
 
 static inline int wpa_key_mgmt_wpa(int akm)
 {
 	return wpa_key_mgmt_wpa_ieee8021x(akm) ||
-		wpa_key_mgmt_wpa_psk(akm);
+		wpa_key_mgmt_wpa_psk(akm) ||
+		wpa_key_mgmt_sae(akm);
 }
 
 static inline int wpa_key_mgmt_wpa_any(int akm)
@@ -104,6 +125,7 @@ static inline int wpa_key_mgmt_cckm(int akm)
 #define WPA_PROTO_WPA BIT(0)
 #define WPA_PROTO_RSN BIT(1)
 #define WPA_PROTO_WAPI BIT(2)
+#define WPA_PROTO_OSEN BIT(3)
 
 #define WPA_AUTH_ALG_OPEN BIT(0)
 #define WPA_AUTH_ALG_SHARED BIT(1)
@@ -127,42 +149,6 @@ enum wpa_alg {
 	WPA_ALG_BIP_GMAC_128,
 	WPA_ALG_BIP_GMAC_256,
 	WPA_ALG_BIP_CMAC_256
-};
-
-/**
- * enum wpa_cipher - Cipher suites
- */
-enum wpa_cipher {
-	CIPHER_NONE,
-	CIPHER_WEP40,
-	CIPHER_TKIP,
-	CIPHER_CCMP,
-	CIPHER_WEP104,
-	CIPHER_GCMP,
-	CIPHER_SMS4,
-	CIPHER_GCMP_256,
-	CIPHER_CCMP_256
-};
-
-/**
- * enum wpa_key_mgmt - Key management suites
- */
-enum wpa_key_mgmt {
-	KEY_MGMT_802_1X,
-	KEY_MGMT_PSK,
-	KEY_MGMT_NONE,
-	KEY_MGMT_802_1X_NO_WPA,
-	KEY_MGMT_WPA_NONE,
-	KEY_MGMT_FT_802_1X,
-	KEY_MGMT_FT_PSK,
-	KEY_MGMT_802_1X_SHA256,
-	KEY_MGMT_PSK_SHA256,
-	KEY_MGMT_WPS,
-	KEY_MGMT_SAE,
-	KEY_MGMT_FT_SAE,
-	KEY_MGMT_WAPI_PSK,
-	KEY_MGMT_WAPI_CERT,
-	KEY_MGMT_CCKM
 };
 
 /**
@@ -309,6 +295,7 @@ enum hostapd_hw_mode {
 	HOSTAPD_MODE_IEEE80211G,
 	HOSTAPD_MODE_IEEE80211A,
 	HOSTAPD_MODE_IEEE80211AD,
+	HOSTAPD_MODE_IEEE80211ANY,
 	NUM_HOSTAPD_MODES
 };
 
@@ -323,10 +310,28 @@ enum wpa_ctrl_req_type {
 	WPA_CTRL_REQ_EAP_PIN,
 	WPA_CTRL_REQ_EAP_OTP,
 	WPA_CTRL_REQ_EAP_PASSPHRASE,
+	WPA_CTRL_REQ_SIM,
+	WPA_CTRL_REQ_PSK_PASSPHRASE,
 	NUM_WPA_CTRL_REQS
 };
 
 /* Maximum number of EAP methods to store for EAP server user information */
 #define EAP_MAX_METHODS 8
+
+enum mesh_plink_state {
+	PLINK_LISTEN = 1,
+	PLINK_OPEN_SENT,
+	PLINK_OPEN_RCVD,
+	PLINK_CNF_RCVD,
+	PLINK_ESTAB,
+	PLINK_HOLDING,
+	PLINK_BLOCKED,
+};
+
+enum set_band {
+	WPA_SETBAND_AUTO,
+	WPA_SETBAND_5G,
+	WPA_SETBAND_2G
+};
 
 #endif /* DEFS_H */

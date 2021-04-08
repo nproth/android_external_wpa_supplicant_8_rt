@@ -12,6 +12,7 @@
 #include "common/defs.h"
 #include "common/eapol_common.h"
 #include "common/wpa_common.h"
+#include "common/ieee802_11_defs.h"
 
 #ifdef _MSC_VER
 #pragma pack(push, 1)
@@ -42,6 +43,7 @@ struct ft_rrb_frame {
 #define FT_R0KH_R1KH_PULL_DATA_LEN 44
 #define FT_R0KH_R1KH_RESP_DATA_LEN 76
 #define FT_R0KH_R1KH_PUSH_DATA_LEN 88
+#define FT_R0KH_R1KH_PULL_NONCE_LEN 16
 
 struct ft_r0kh_r1kh_pull_frame {
 	u8 frame_type; /* RSN_REMOTE_FRAME_TYPE_FT_RRB */
@@ -49,7 +51,7 @@ struct ft_r0kh_r1kh_pull_frame {
 	le16 data_length; /* little endian length of data (44) */
 	u8 ap_address[ETH_ALEN];
 
-	u8 nonce[16];
+	u8 nonce[FT_R0KH_R1KH_PULL_NONCE_LEN];
 	u8 pmk_r0_name[WPA_PMK_NAME_LEN];
 	u8 r1kh_id[FT_R1KH_ID_LEN];
 	u8 s1kh_id[ETH_ALEN];
@@ -63,7 +65,7 @@ struct ft_r0kh_r1kh_resp_frame {
 	le16 data_length; /* little endian length of data (76) */
 	u8 ap_address[ETH_ALEN];
 
-	u8 nonce[16]; /* copied from pull */
+	u8 nonce[FT_R0KH_R1KH_PULL_NONCE_LEN]; /* copied from pull */
 	u8 r1kh_id[FT_R1KH_ID_LEN]; /* copied from pull */
 	u8 s1kh_id[ETH_ALEN]; /* copied from pull */
 	u8 pmk_r1[PMK_LEN];
@@ -145,8 +147,7 @@ struct wpa_auth_config {
 	int group_mgmt_cipher;
 #endif /* CONFIG_IEEE80211W */
 #ifdef CONFIG_IEEE80211R
-#define SSID_LEN 32
-	u8 ssid[SSID_LEN];
+	u8 ssid[SSID_MAX_LEN];
 	size_t ssid_len;
 	u8 mobility_domain[MOBILITY_DOMAIN_ID_LEN];
 	u8 r0_key_holder[FT_R0KH_ID_MAX_LEN];
@@ -164,6 +165,12 @@ struct wpa_auth_config {
 #ifdef CONFIG_TESTING_OPTIONS
 	double corrupt_gtk_rekey_mic_probability;
 #endif /* CONFIG_TESTING_OPTIONS */
+#ifdef CONFIG_P2P
+	u8 ip_addr_go[4];
+	u8 ip_addr_mask[4];
+	u8 ip_addr_start[4];
+	u8 ip_addr_end[4];
+#endif /* CONFIG_P2P */
 };
 
 typedef enum {
@@ -182,6 +189,7 @@ struct wpa_auth_callbacks {
 		       const char *txt);
 	void (*disconnect)(void *ctx, const u8 *addr, u16 reason);
 	int (*mic_failure_report)(void *ctx, const u8 *addr);
+	void (*psk_failure_report)(void *ctx, const u8 *addr);
 	void (*set_eapol)(void *ctx, const u8 *addr, wpa_eapol_variable var,
 			  int value);
 	int (*get_eapol)(void *ctx, const u8 *addr, wpa_eapol_variable var);
@@ -204,8 +212,11 @@ struct wpa_auth_callbacks {
 	int (*send_ft_action)(void *ctx, const u8 *dst,
 			      const u8 *data, size_t data_len);
 	int (*add_tspec)(void *ctx, const u8 *sta_addr, u8 *tspec_ie,
-                         size_t tspec_ielen);
+			 size_t tspec_ielen);
 #endif /* CONFIG_IEEE80211R */
+#ifdef CONFIG_MESH
+	int (*start_ampe)(void *ctx, const u8 *sta_addr);
+#endif /* CONFIG_MESH */
 };
 
 struct wpa_authenticator * wpa_init(const u8 *addr,
@@ -227,6 +238,9 @@ int wpa_validate_wpa_ie(struct wpa_authenticator *wpa_auth,
 			struct wpa_state_machine *sm,
 			const u8 *wpa_ie, size_t wpa_ie_len,
 			const u8 *mdie, size_t mdie_len);
+int wpa_validate_osen(struct wpa_authenticator *wpa_auth,
+		      struct wpa_state_machine *sm,
+		      const u8 *osen_ie, size_t osen_ie_len);
 int wpa_auth_uses_mfp(struct wpa_state_machine *sm);
 struct wpa_state_machine *
 wpa_auth_sta_init(struct wpa_authenticator *wpa_auth, const u8 *addr,
@@ -266,6 +280,8 @@ int wpa_auth_pmksa_add_preauth(struct wpa_authenticator *wpa_auth,
 			       const u8 *pmk, size_t len, const u8 *sta_addr,
 			       int session_timeout,
 			       struct eapol_state_machine *eapol);
+int wpa_auth_pmksa_add_sae(struct wpa_authenticator *wpa_auth, const u8 *addr,
+			   const u8 *pmk);
 void wpa_auth_pmksa_remove(struct wpa_authenticator *wpa_auth,
 			   const u8 *sta_addr);
 int wpa_auth_sta_set_vlan(struct wpa_state_machine *sm, int vlan_id);
@@ -296,5 +312,13 @@ int wpa_wnmsleep_gtk_subelem(struct wpa_state_machine *sm, u8 *pos);
 int wpa_wnmsleep_igtk_subelem(struct wpa_state_machine *sm, u8 *pos);
 
 int wpa_auth_uses_sae(struct wpa_state_machine *sm);
+int wpa_auth_uses_ft_sae(struct wpa_state_machine *sm);
+
+int wpa_auth_get_ip_addr(struct wpa_state_machine *sm, u8 *addr);
+
+struct radius_das_attrs;
+int wpa_auth_radius_das_disconnect_pmksa(struct wpa_authenticator *wpa_auth,
+					 struct radius_das_attrs *attr);
+void wpa_auth_reconfig_group_keys(struct wpa_authenticator *wpa_auth);
 
 #endif /* WPA_AUTH_H */

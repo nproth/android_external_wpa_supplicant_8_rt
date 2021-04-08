@@ -35,7 +35,7 @@ WPA_SUPPL_DIR_INCLUDE = $(WPA_SUPPL_DIR)/src \
 	$(WPA_SUPPL_DIR)/wpa_supplicant
 
 ifdef CONFIG_DRIVER_NL80211
-WPA_SUPPL_DIR_INCLUDE += external/libnl-headers
+WPA_SUPPL_DIR_INCLUDE += external/libnl/include
 WPA_SRC_FILE += driver_cmd_nl80211.c
 endif
 
@@ -43,8 +43,8 @@ ifdef CONFIG_DRIVER_WEXT
 WPA_SRC_FILE += driver_cmd_wext.c
 endif
 
-# To force sizeof(enum) = 4
 ifeq ($(TARGET_ARCH),arm)
+# To force sizeof(enum) = 4
 L_CFLAGS += -mabi=aapcs-linux
 endif
 
@@ -52,6 +52,9 @@ ifdef CONFIG_ANDROID_LOG
 L_CFLAGS += -DCONFIG_ANDROID_LOG
 endif
 
+ifdef CONFIG_P2P
+L_CFLAGS += -DCONFIG_P2P
+endif
 ########################
 
 include $(CLEAR_VARS)
