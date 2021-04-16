@@ -38,6 +38,18 @@
 #include "rfkill.h"
 #include "driver_nl80211.h"
 
+#ifdef CONFIG_LIBNL20
+/*
+ * The following two functions are not implemented on cm-11.0 in libnl_2
+ */
+int nla_put_string(struct nl_msg *msg, int attrtype, const char* str) {
+	return nla_put(msg, attrtype, strlen(str)+1, str);
+}
+
+int nla_put_flag(struct nl_msg *msg, int attrtype) {
+	return nla_put(msg, attrtype, 0, NULL);
+}
+#endif
 
 #ifndef CONFIG_LIBNL20
 /*
